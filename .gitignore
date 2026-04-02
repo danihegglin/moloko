@@ -1,3 +1,6 @@
 .idea/
 *.iml
 moloko
+ui/node_modules/
+ui/dist/*
+!ui/dist/index.html

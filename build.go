@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -105,7 +106,11 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	image := imageBase + ":" + branchToTag(branch)
 	res := BuildResult{Branch: branch, Image: image}
 
+	// logW streams stdout+stderr of subcommands to the hub line by line.
+	// nil in CLI mode (hub == nil) so output goes nowhere (errors still captured).
+	var logW io.Writer
 	if hub != nil {
+		logW = &lineWriter{fn: func(line string) { hub.Log(branch, line) }}
 		hub.Update(BranchState{Branch: branch, Phase: PhaseCloning, Image: image})
 	}
 
@@ -123,7 +128,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	cloneDir := filepath.Join(tmpDir, "src")
 
 	// Git clones run in parallel — they are I/O bound and don't touch Docker storage.
-	if err := run(ctx, tmpDir, gitSSHEnv, "git",
+	if err := run(ctx, tmpDir, gitSSHEnv, "git", logW,
 		"clone", "--depth=1", "--branch", branch, "--single-branch",
 		repoURL, cloneDir,
 	); err != nil {
@@ -142,14 +147,14 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	// Acquire the docker semaphore: limits how many builds touch Docker's overlay
 	// storage simultaneously, preventing "no space left on device" under parallel load.
 	dockerSem <- struct{}{}
-	buildErr := run(ctx, cloneDir, "", "docker",
+	buildErr := run(ctx, cloneDir, "", "docker", logW,
 		"build", "-t", image,
 		"-f", filepath.Join(cloneDir, dockerfile),
 		cloneDir,
 	)
 	// Prune dangling build cache before releasing the slot so the next build
 	// starts with freed space. Active layers are pinned and won't be removed.
-	_ = run(ctx, "", "", "docker", "builder", "prune", "-f")
+	_ = run(ctx, "", "", "docker", nil, "builder", "prune", "-f")
 	<-dockerSem
 
 	if buildErr != nil {
@@ -165,7 +170,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		if hub != nil {
 			hub.Update(BranchState{Branch: branch, Phase: PhasePushing, Image: image, ElapsedMs: time.Since(start).Milliseconds()})
 		}
-		if err := run(ctx, cloneDir, "", "docker", "push", image); err != nil {
+		if err := run(ctx, cloneDir, "", "docker", logW, "push", image); err != nil {
 			res.Err = fmt.Errorf("docker push: %w", err)
 			res.Elapsed = time.Since(start)
 			if hub != nil {
@@ -182,18 +187,50 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	return res
 }
 
-// run executes a command, capturing stderr for error messages.
+// lineWriter calls fn for each complete line written to it.
+// Safe for concurrent use — cmd.Stdout and cmd.Stderr may write simultaneously.
+type lineWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	fn  func(string)
+}
+
+func (lw *lineWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	lw.buf = append(lw.buf, p...)
+	for {
+		i := bytes.IndexByte(lw.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimRight(string(lw.buf[:i]), "\r")
+		lw.buf = lw.buf[i+1:]
+		if line != "" {
+			lw.fn(line)
+		}
+	}
+	return len(p), nil
+}
+
+// run executes a command, capturing stderr for error reporting.
+// If out is non-nil, both stdout and stderr are also streamed to it line by line.
 // extraEnv, if non-empty, is appended to the current process environment.
-func run(ctx context.Context, dir, extraEnv, name string, args ...string) error {
-	var stderr bytes.Buffer
+func run(ctx context.Context, dir, extraEnv, name string, out io.Writer, args ...string) error {
+	var errBuf bytes.Buffer
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	cmd.Stderr = &stderr
 	if extraEnv != "" {
 		cmd.Env = append(os.Environ(), extraEnv)
 	}
+	if out != nil {
+		cmd.Stdout = out
+		cmd.Stderr = io.MultiWriter(&errBuf, out)
+	} else {
+		cmd.Stderr = &errBuf
+	}
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := strings.TrimSpace(errBuf.String())
 		if msg != "" {
 			return fmt.Errorf("%w\n%s", err, msg)
 		}

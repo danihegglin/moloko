@@ -112,7 +112,8 @@ body {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  align-items: start;
   gap: 12px;
   padding: 20px;
 }
@@ -202,6 +203,29 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ── Log panel ── */
+
+.log-panel {
+  max-height: 220px;
+  overflow-y: auto;
+  background: #090f1a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-top: 4px;
+}
+
+.log-pre {
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #94a3b8;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ── Error ── */
 
 .error-pre {
   font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace;

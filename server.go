@@ -41,11 +41,18 @@ type Summary struct {
 	ElapsedMs int64 `json:"elapsedMs"`
 }
 
+// LogLine is a single log line emitted from a branch build.
+type LogLine struct {
+	Branch string `json:"branch"`
+	Line   string `json:"line"`
+}
+
 // Hub manages SSE clients and branch build state.
 type Hub struct {
 	repo     string
 	branches []string
 	state    map[string]BranchState
+	logs     map[string][]string
 	clients  map[chan string]struct{}
 	summary  *Summary
 	mu       sync.Mutex
@@ -57,12 +64,21 @@ func NewHub(repo string, branches []string) *Hub {
 		repo:     repo,
 		branches: branches,
 		state:    make(map[string]BranchState, len(branches)),
+		logs:     make(map[string][]string, len(branches)),
 		clients:  make(map[chan string]struct{}),
 	}
 	for _, b := range branches {
 		h.state[b] = BranchState{Branch: b, Phase: PhaseQueued}
 	}
 	return h
+}
+
+// Log appends a log line for a branch and broadcasts it to all clients.
+func (h *Hub) Log(branch, line string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.logs[branch] = append(h.logs[branch], line)
+	h.broadcast("log", LogLine{Branch: branch, Line: line})
 }
 
 // Update stores a branch state and broadcasts an "update" event to all clients.
@@ -94,9 +110,10 @@ func (h *Hub) broadcast(event string, data any) {
 }
 
 type initPayload struct {
-	Repo     string        `json:"repo"`
-	Branches []string      `json:"branches"`
-	States   []BranchState `json:"states"`
+	Repo     string              `json:"repo"`
+	Branches []string            `json:"branches"`
+	States   []BranchState       `json:"states"`
+	Logs     map[string][]string `json:"logs"`
 }
 
 // subscribe registers a new SSE client and returns its channel plus an unsubscribe func.
@@ -111,10 +128,19 @@ func (h *Hub) subscribe() (chan string, func()) {
 	for _, b := range h.branches {
 		states = append(states, h.state[b])
 	}
+	logsCopy := make(map[string][]string, len(h.logs))
+	for branch, lines := range h.logs {
+		if len(lines) > 0 {
+			cp := make([]string, len(lines))
+			copy(cp, lines)
+			logsCopy[branch] = cp
+		}
+	}
 	ch <- sseJSON("init", initPayload{
 		Repo:     h.repo,
 		Branches: h.branches,
 		States:   states,
+		Logs:     logsCopy,
 	})
 
 	if h.summary != nil {

@@ -101,7 +101,9 @@ type BuildResult struct {
 
 // buildBranch shallow-clones a branch, then acquires the docker semaphore before
 // running docker build + prune so that at most cap(dockerSem) builds run at once.
-func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub) BuildResult {
+// cacheSources lists images to pass as --cache-from to docker build; the branch's
+// own image is always prepended so re-runs of the same branch reuse prior layers.
+func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub, cacheSources []string) BuildResult {
 	start := time.Now()
 	image := imageBase + ":" + branchToTag(branch)
 	res := BuildResult{Branch: branch, Image: image}
@@ -146,12 +148,28 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 
 	// Acquire the docker semaphore: limits how many builds touch Docker's overlay
 	// storage simultaneously, preventing "no space left on device" under parallel load.
-	dockerSem <- struct{}{}
-	buildErr := run(ctx, cloneDir, "", "docker", logW,
-		"build", "-t", image,
-		"-f", filepath.Join(cloneDir, dockerfile),
-		cloneDir,
-	)
+	// Use select so a cancelled context unblocks immediately instead of hanging.
+	select {
+	case dockerSem <- struct{}{}:
+	case <-ctx.Done():
+		res.Err = ctx.Err()
+		res.Elapsed = time.Since(start)
+		if hub != nil {
+			hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
+		}
+		return res
+	}
+
+	// Build the argument list. Always try the branch's own previous image first
+	// so re-runs skip unchanged layers. Then fall through to any supplied sources
+	// (typically the main/master images built in the first phase of this run).
+	buildArgs := []string{"build", "-t", image, "--cache-from", image}
+	for _, src := range cacheSources {
+		buildArgs = append(buildArgs, "--cache-from", src)
+	}
+	buildArgs = append(buildArgs, "-f", filepath.Join(cloneDir, dockerfile), cloneDir)
+
+	buildErr := run(ctx, cloneDir, "", "docker", logW, buildArgs...)
 	// Prune dangling build cache before releasing the slot so the next build
 	// starts with freed space. Active layers are pinned and won't be removed.
 	_ = run(ctx, "", "", "docker", nil, "builder", "prune", "-f")
@@ -239,32 +257,70 @@ func run(ctx context.Context, dir, extraEnv, name string, out io.Writer, args ..
 	return nil
 }
 
-// buildAll fans out builds across a worker pool and streams results as they complete.
+// printResult logs a build result to stdout in CLI mode.
+func printResult(r BuildResult) {
+	if r.Err != nil {
+		fmt.Printf("[FAIL] %-50s (%v) %v\n", r.Branch, r.Elapsed.Round(time.Millisecond), r.Err)
+	} else {
+		fmt.Printf("[ OK ] %-50s -> %s (%v)\n", r.Branch, r.Image, r.Elapsed.Round(time.Millisecond))
+	}
+}
+
+// buildAll builds all branches in two phases:
+//
+//  1. Primary branches (main, master) are built sequentially first. Their
+//     images seed the Docker layer cache for the branches that follow.
+//
+//  2. Feature branches run in parallel, each receiving the primary images as
+//     --cache-from sources so dependency layers are reused without re-downloading.
 func buildAll(ctx context.Context, repoURL string, branches []string, imageBase, dockerfile, gitSSHEnv string, push bool, numWorkers, numBuildWorkers int, hub *Hub) []BuildResult {
-	// dockerSem caps concurrent docker build+prune operations.
 	dockerSem := make(chan struct{}, numBuildWorkers)
 
-	jobs := make(chan string, len(branches))
+	var primary, feature []string
 	for _, b := range branches {
+		if b == "main" || b == "master" {
+			primary = append(primary, b)
+		} else {
+			feature = append(feature, b)
+		}
+	}
+
+	var results []BuildResult
+
+	// Phase 1 — primary branches, sequential, no external cache sources yet.
+	var cacheImages []string
+	for _, b := range primary {
+		r := buildBranch(ctx, repoURL, b, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, nil)
+		if hub == nil {
+			printResult(r)
+		}
+		results = append(results, r)
+		if r.Err == nil {
+			cacheImages = append(cacheImages, r.Image)
+		}
+	}
+
+	if len(feature) == 0 {
+		return results
+	}
+
+	// Phase 2 — feature branches, parallel, seeded from primary image cache.
+	jobs := make(chan string, len(feature))
+	for _, b := range feature {
 		jobs <- b
 	}
 	close(jobs)
 
-	resultsCh := make(chan BuildResult, len(branches))
-
+	resultsCh := make(chan BuildResult, len(feature))
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for branch := range jobs {
-				r := buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub)
+				r := buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cacheImages)
 				if hub == nil {
-					if r.Err != nil {
-						fmt.Printf("[FAIL] %-50s (%v) %v\n", r.Branch, r.Elapsed.Round(time.Millisecond), r.Err)
-					} else {
-						fmt.Printf("[ OK ] %-50s -> %s (%v)\n", r.Branch, r.Image, r.Elapsed.Round(time.Millisecond))
-					}
+					printResult(r)
 				}
 				resultsCh <- r
 			}
@@ -274,7 +330,6 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 	wg.Wait()
 	close(resultsCh)
 
-	results := make([]BuildResult, 0, len(branches))
 	for r := range resultsCh {
 		results = append(results, r)
 	}

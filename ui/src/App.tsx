@@ -1,4 +1,4 @@
-import { useReducer, useEffect, useRef } from 'react'
+import { useReducer, useEffect, useRef, useState } from 'react'
 import './App.css'
 
 type Phase = 'queued' | 'cloning' | 'building' | 'pushing' | 'done' | 'failed'
@@ -98,9 +98,12 @@ function LogPanel({ lines }: { lines: string[] }) {
   )
 }
 
-function BranchCard({ state, logs }: { state: BranchState; logs: string[] }) {
+function BranchCard({ state, logs, buildStart }: { state: BranchState; logs: string[]; buildStart?: number }) {
   const color = PHASE_COLOR[state.phase]
   const isActive = ACTIVE_PHASES.includes(state.phase)
+  const elapsedMs = isActive && buildStart != null
+    ? Date.now() - buildStart
+    : state.elapsedMs
 
   return (
     <div className="card" style={{ borderLeftColor: color }}>
@@ -111,8 +114,8 @@ function BranchCard({ state, logs }: { state: BranchState; logs: string[] }) {
           {PHASE_LABEL[state.phase]}
         </span>
       </div>
-      {state.elapsedMs != null && state.elapsedMs > 0 && (
-        <div className="elapsed">{formatMs(state.elapsedMs)}</div>
+      {elapsedMs != null && elapsedMs > 0 && (
+        <div className="elapsed">{formatMs(elapsedMs)}</div>
       )}
       {state.phase === 'done' && state.image && (
         <div className="image-name" title={state.image}>{state.image}</div>
@@ -127,6 +130,16 @@ function BranchCard({ state, logs }: { state: BranchState; logs: string[] }) {
 
 export default function App() {
   const [state, dispatch] = useReducer(reducer, initialState)
+  // buildStarts maps branch -> (Date.now() - elapsedMs at last active-phase update),
+  // giving a stable anchor from which live elapsed time is computed each render.
+  const buildStartsRef = useRef<Record<string, number>>({})
+  // Tick every second to re-render active cards with an updated elapsed time.
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   useEffect(() => {
     const es = new EventSource('/events')
@@ -135,9 +148,21 @@ export default function App() {
         const msg = JSON.parse(e.data) as { event: string; data: unknown }
         if (msg.event === 'init') {
           const d = msg.data as { repo: string; branches: string[]; states: BranchState[]; logs: Record<string, string[]> }
+          buildStartsRef.current = {}
+          for (const s of d.states) {
+            if (ACTIVE_PHASES.includes(s.phase)) {
+              buildStartsRef.current[s.branch] = Date.now() - (s.elapsedMs ?? 0)
+            }
+          }
           dispatch({ type: 'init', repo: d.repo, branches: d.branches, states: d.states, logs: d.logs ?? {} })
         } else if (msg.event === 'update') {
-          dispatch({ type: 'update', state: msg.data as BranchState })
+          const s = msg.data as BranchState
+          if (ACTIVE_PHASES.includes(s.phase)) {
+            buildStartsRef.current[s.branch] = Date.now() - (s.elapsedMs ?? 0)
+          } else {
+            delete buildStartsRef.current[s.branch]
+          }
+          dispatch({ type: 'update', state: s })
         } else if (msg.event === 'log') {
           const d = msg.data as { branch: string; line: string }
           dispatch({ type: 'log', branch: d.branch, line: d.line })
@@ -184,7 +209,12 @@ export default function App() {
       <main className="grid">
         {state.branches.map((b) =>
           state.states[b] ? (
-            <BranchCard key={b} state={state.states[b]} logs={state.logs[b] ?? []} />
+            <BranchCard
+              key={b}
+              state={state.states[b]}
+              logs={state.logs[b] ?? []}
+              buildStart={buildStartsRef.current[b]}
+            />
           ) : null,
         )}
       </main>

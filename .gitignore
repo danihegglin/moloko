@@ -1,6 +1,7 @@
 .idea/
 *.iml
 moloko
+.moloko-state.json
 ui/node_modules/
 ui/dist/*
 !ui/dist/index.html

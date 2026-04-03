@@ -89,6 +89,48 @@ func (h *Hub) Update(s BranchState) {
 	h.broadcast("update", s)
 }
 
+// ResetForCycle prepares the hub for a new watch cycle. It updates the branch
+// list, resets state and logs for every branch in the rebuilding set, and
+// broadcasts a fresh "init" so connected clients re-render cleanly.
+func (h *Hub) ResetForCycle(allBranches []string, rebuilding map[string]bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.branches = allBranches
+	h.summary = nil
+
+	// Ensure any newly discovered branches exist in the state map.
+	for _, b := range allBranches {
+		if _, ok := h.state[b]; !ok {
+			h.state[b] = BranchState{Branch: b, Phase: PhaseQueued}
+		}
+	}
+	// Reset only the branches that are being rebuilt.
+	for b := range rebuilding {
+		h.state[b] = BranchState{Branch: b, Phase: PhaseQueued}
+		delete(h.logs, b)
+	}
+
+	states := make([]BranchState, 0, len(allBranches))
+	for _, b := range allBranches {
+		states = append(states, h.state[b])
+	}
+	logsCopy := make(map[string][]string, len(h.logs))
+	for branch, lines := range h.logs {
+		if len(lines) > 0 {
+			cp := make([]string, len(lines))
+			copy(cp, lines)
+			logsCopy[branch] = cp
+		}
+	}
+	h.broadcast("init", initPayload{
+		Repo:     h.repo,
+		Branches: allBranches,
+		States:   states,
+		Logs:     logsCopy,
+	})
+}
+
 // Finish stores the summary and broadcasts a "done" event to all clients.
 func (h *Hub) Finish(s Summary) {
 	h.mu.Lock()

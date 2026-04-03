@@ -60,8 +60,14 @@ func sshEnv(keyPath string) string {
 	)
 }
 
+// RemoteBranch is a branch name paired with its current tip commit SHA.
+type RemoteBranch struct {
+	Name string
+	SHA  string
+}
+
 // listBranches queries the remote repository without cloning it.
-func listBranches(ctx context.Context, repoURL, gitSSHEnv string) ([]string, error) {
+func listBranches(ctx context.Context, repoURL, gitSSHEnv string) ([]RemoteBranch, error) {
 	var stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, "git", "ls-remote", "--heads", repoURL)
 	cmd.Stderr = &stderr
@@ -76,17 +82,20 @@ func listBranches(ctx context.Context, repoURL, gitSSHEnv string) ([]string, err
 		}
 		return nil, fmt.Errorf("git ls-remote: %w", err)
 	}
-	var branches []string
+	var branches []RemoteBranch
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
 		}
-		// Each line: <hash>\trefs/heads/<branch>
+		// Each line: <sha>\trefs/heads/<branch>
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) != 2 {
 			continue
 		}
-		branches = append(branches, strings.TrimPrefix(parts[1], "refs/heads/"))
+		branches = append(branches, RemoteBranch{
+			Name: strings.TrimPrefix(parts[1], "refs/heads/"),
+			SHA:  parts[0],
+		})
 	}
 	return branches, nil
 }

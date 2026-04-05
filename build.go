@@ -112,7 +112,12 @@ type BuildResult struct {
 // running docker build + prune so that at most cap(dockerSem) builds run at once.
 // cacheSources lists images to pass as --cache-from to docker build; the branch's
 // own image is always prepended so re-runs of the same branch reuse prior layers.
-func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub, cacheSources []string) BuildResult {
+// buildBranch builds (and optionally pushes) a Docker image for a single branch.
+// When builderName is non-empty, it uses `docker buildx build --push` with the
+// named builder so that build and push happen in one step via BuildKit — this is
+// required when pushing to a non-localhost registry that is only reachable over
+// plain HTTP (e.g. the built-in registry on macOS/Windows).
+func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub, cacheSources []string, builderName string) BuildResult {
 	start := time.Now()
 	image := imageBase + ":" + branchToTag(branch)
 	res := BuildResult{Branch: branch, Image: image}
@@ -169,16 +174,37 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		return res
 	}
 
-	// Build the argument list. Always try the branch's own previous image first
-	// so re-runs skip unchanged layers. Then fall through to any supplied sources
+	// Build (and optionally push) the image.
+	// Always try the branch's own previous image first so re-runs skip
+	// unchanged layers, then fall through to any supplied cache sources
 	// (typically the main/master images built in the first phase of this run).
-	buildArgs := []string{"build", "-t", image, "--cache-from", image}
-	for _, src := range cacheSources {
-		buildArgs = append(buildArgs, "--cache-from", src)
+	var buildErr error
+	if builderName != "" {
+		// Use `docker buildx build --push` so BuildKit handles the push
+		// directly from inside Docker's VM using the pre-configured builder
+		// (which has the registry marked as plain-HTTP/insecure in its
+		// buildkitd.toml). This avoids TLS issues with non-localhost registries
+		// on macOS/Windows where `docker push` goes through the daemon.
+		bxArgs := []string{"buildx", "build",
+			"--builder", builderName,
+			"--push",
+			"-t", image,
+			"--cache-from", image,
+		}
+		for _, src := range cacheSources {
+			bxArgs = append(bxArgs, "--cache-from", src)
+		}
+		bxArgs = append(bxArgs, "-f", filepath.Join(cloneDir, dockerfile), cloneDir)
+		buildErr = run(ctx, cloneDir, "", "docker", logW, bxArgs...)
+	} else {
+		bArgs := []string{"build", "-t", image, "--cache-from", image}
+		for _, src := range cacheSources {
+			bArgs = append(bArgs, "--cache-from", src)
+		}
+		bArgs = append(bArgs, "-f", filepath.Join(cloneDir, dockerfile), cloneDir)
+		buildErr = run(ctx, cloneDir, "", "docker", logW, bArgs...)
 	}
-	buildArgs = append(buildArgs, "-f", filepath.Join(cloneDir, dockerfile), cloneDir)
 
-	buildErr := run(ctx, cloneDir, "", "docker", logW, buildArgs...)
 	// Prune dangling build cache before releasing the slot so the next build
 	// starts with freed space. Active layers are pinned and won't be removed.
 	_ = run(ctx, "", "", "docker", nil, "builder", "prune", "-f")
@@ -193,7 +219,8 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		return res
 	}
 
-	if push {
+	// Separate push step only when not using buildx (buildx --push already pushed above).
+	if push && builderName == "" {
 		if hub != nil {
 			hub.Update(BranchState{Branch: branch, Phase: PhasePushing, Image: image, ElapsedMs: time.Since(start).Milliseconds()})
 		}
@@ -282,7 +309,7 @@ func printResult(r BuildResult) {
 //
 //  2. Feature branches run in parallel, each receiving the primary images as
 //     --cache-from sources so dependency layers are reused without re-downloading.
-func buildAll(ctx context.Context, repoURL string, branches []string, imageBase, dockerfile, gitSSHEnv string, push bool, numWorkers, numBuildWorkers int, hub *Hub) []BuildResult {
+func buildAll(ctx context.Context, repoURL string, branches []string, imageBase, dockerfile, gitSSHEnv string, push bool, numWorkers, numBuildWorkers int, hub *Hub, builderName string) []BuildResult {
 	dockerSem := make(chan struct{}, numBuildWorkers)
 
 	var primary, feature []string
@@ -299,7 +326,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 	// Phase 1 — primary branches, sequential, no external cache sources yet.
 	var cacheImages []string
 	for _, b := range primary {
-		r := buildBranch(ctx, repoURL, b, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, nil)
+		r := buildBranch(ctx, repoURL, b, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, nil, builderName)
 		if hub == nil {
 			printResult(r)
 		}
@@ -327,7 +354,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 		go func() {
 			defer wg.Done()
 			for branch := range jobs {
-				r := buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cacheImages)
+				r := buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cacheImages, builderName)
 				if hub == nil {
 					printResult(r)
 				}

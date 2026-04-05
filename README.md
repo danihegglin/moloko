@@ -39,9 +39,17 @@ moloko --repo <url> [flags]
 |---|---|---|
 | `--repo` | _(required)_ | Git repository URL |
 | `--image` | repo name | Base name for built images |
-| `--workers` | CPU count | Number of parallel builds |
+| `--workers` | CPU count | Number of parallel git clones |
+| `--build-workers` | `1` | Number of concurrent docker builds |
 | `--dockerfile` | `Dockerfile` | Dockerfile path relative to repo root |
-| `--push` | `false` | Push images to the registry after building |
+| `--push` | `false` | Push images to a registry after building |
+| `--key` | | Path to SSH private key for private repositories |
+| `--port` | | Address to serve the web UI on, e.g. `:8080` |
+| `--state` | `.moloko-state.json` | Path to the build-state file (tracks last-built SHAs) |
+| `--watch` | `false` | Poll for branch changes and rebuild when new commits arrive |
+| `--interval` | `60s` | Polling interval used with `--watch` |
+| `--registry` | | Start a built-in OCI registry on this address, e.g. `:5000` (implies `--push`) |
+| `--registry-dir` | `.moloko-registry` | Storage directory for the built-in registry |
 
 ## Examples
 
@@ -64,6 +72,32 @@ Use a Dockerfile in a subdirectory:
 ```sh
 moloko --repo https://github.com/acme/api \
        --dockerfile docker/Dockerfile.prod
+```
+
+Build and store images in the built-in OCI registry:
+
+```sh
+moloko --repo https://github.com/acme/api \
+       --registry :5000
+```
+
+Images are pushed to `localhost:5000/<repo>:<branch-tag>` automatically. The registry implements the OCI Distribution Spec v2 and is compatible with `docker pull`, `docker push`, and standard tooling. Data is stored under `.moloko-registry/` in the current directory.
+
+Enable the web UI and watch for changes in CI:
+
+```sh
+moloko --repo https://github.com/acme/api \
+       --registry :5000 \
+       --port :8080 \
+       --watch \
+       --interval 30s
+```
+
+Use a private repository with an SSH key:
+
+```sh
+moloko --repo git@github.com:acme/api.git \
+       --key ~/.ssh/id_ed25519
 ```
 
 ## Output
@@ -100,8 +134,27 @@ Branch names are lowercased and non-alphanumeric characters (`/`, `_`, `#`, spac
 
 ## How it works
 
-1. `git ls-remote --heads` lists all remote branches with no local clone.
+1. `git ls-remote --heads` lists all remote branches and their commit SHAs without cloning.
 2. Branches are filtered by name: `main`, `master`, or containing a Jira ticket ID.
-3. A worker pool (default: one worker per CPU) pulls from a job queue.
-4. Each worker does a `--depth=1` single-branch clone into a temp directory, runs `docker build`, and optionally `docker push`.
-5. Temp directories are removed automatically after each build.
+3. SHAs are compared against the state file (`.moloko-state.json`). Only branches with a new commit are built. Any branch whose image is no longer available is also rebuilt, even if the SHA hasn't changed.
+4. `main`/`master` are built first, sequentially, to seed the Docker layer cache.
+5. Feature branches run in parallel. Each build receives the primary images as `--cache-from` sources.
+6. A semaphore (controlled by `--build-workers`) limits concurrent docker builds to prevent overlay storage exhaustion.
+7. After each build, `docker builder prune -f` reclaims dangling cache before the next build slot opens.
+8. When `--registry` is set, a built-in OCI-compliant registry starts on the given address. The image base is automatically prefixed with the registry host and `--push` is enabled.
+
+## Built-in registry
+
+The `--registry` flag starts a zero-configuration OCI Distribution Spec v2 registry embedded in the moloko binary — no separate container or daemon required.
+
+- Blobs are stored content-addressably under `<registry-dir>/blobs/sha256/`
+- Uploads stream directly to disk with a running SHA-256; nothing is buffered in memory
+- Cross-repository blob mounting is supported (avoids re-uploading shared layers)
+- Range requests are served via `http.ServeContent` for efficient layer pulls
+- Manifests are stored by digest; tags are pointer files that resolve to a digest
+
+```sh
+# Build and push to built-in registry, then pull from it
+moloko --repo https://github.com/acme/api --registry :5000
+docker pull localhost:5000/api:main
+```

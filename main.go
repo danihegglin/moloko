@@ -63,6 +63,7 @@ func main() {
 	// Built-in registry: start server, prepend host to imageBase, enable push.
 	var registryURL string
 	var reg *Registry
+	var builderName string
 	if *registryFlag != "" {
 		var err error
 		reg, err = NewRegistry(*registryDirFlag)
@@ -70,17 +71,42 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: registry init: %v\n", err)
 			os.Exit(1)
 		}
+		dockerHost := registryDockerHost()
+		registryURL = dockerHost + *registryFlag
+		imageBase = registryURL + "/" + imageBase
+		*pushFlag = true
+
+		// On macOS/Windows the Docker daemon lives in a VM. Docker's push
+		// mechanism requires HTTPS for non-localhost registries, which we
+		// can't easily satisfy. Instead we configure a dedicated buildx
+		// builder whose buildkitd.toml marks our registry as plain-HTTP,
+		// then use `docker buildx build --push` to combine build and push
+		// in one step entirely inside Docker's VM.
+		if err := setupBuildxBuilder(*registryDirFlag, registryURL); err != nil {
+			fmt.Fprintf(os.Stderr, "error: buildx builder setup: %v\n", err)
+			os.Exit(1)
+		}
+		builderName = buildxBuilderName
+
+		// Configure the Docker daemon's insecure-registries so that plain
+		// `docker pull` works. We write directly into the VM's daemon.json and
+		// reload dockerd in one step — no Docker Desktop restart needed.
+		fmt.Printf("Configuring Docker daemon for registry pull support… ")
+		if err := configureDockerPull(registryURL); err != nil {
+			fmt.Fprintf(os.Stderr, "\nwarning: daemon config failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "To enable `docker pull`, add %q to insecure-registries in\nDocker Desktop → Settings → Docker Engine, then Apply & Restart.\n", registryURL)
+		} else {
+			fmt.Println("done.")
+		}
+
 		regSrv := &registryServer{reg: reg, addr: *registryFlag}
 		go func() {
-			fmt.Printf("Built-in registry listening on %s\n", *registryFlag)
+			fmt.Printf("Built-in registry listening on http://%s\n", registryURL)
 			if err := regSrv.start(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "registry error: %v\n", err)
 				cancel()
 			}
 		}()
-		registryURL = "localhost" + *registryFlag
-		imageBase = registryURL + "/" + imageBase
-		*pushFlag = true
 	}
 
 	// Discover branches once upfront so the hub (and server) can be initialised
@@ -134,7 +160,7 @@ func main() {
 		}
 
 		overall := time.Now()
-		results := buildAll(ctx, *repoFlag, toBuild, imageBase, *dockerfileFlag, gitSSHEnv, *pushFlag, *workersFlag, *buildWorkersFlag, hub)
+		results := buildAll(ctx, *repoFlag, toBuild, imageBase, *dockerfileFlag, gitSSHEnv, *pushFlag, *workersFlag, *buildWorkersFlag, hub, builderName)
 		elapsed := time.Since(overall)
 
 		var failed int

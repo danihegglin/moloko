@@ -19,6 +19,7 @@ interface Summary {
 
 interface AppState {
   repo: string
+  registryUrl: string
   branches: string[]
   states: Record<string, BranchState>
   logs: Record<string, string[]>
@@ -26,7 +27,7 @@ interface AppState {
 }
 
 type Action =
-  | { type: 'init'; repo: string; branches: string[]; states: BranchState[]; logs: Record<string, string[]> }
+  | { type: 'init'; repo: string; registryUrl: string; branches: string[]; states: BranchState[]; logs: Record<string, string[]> }
   | { type: 'update'; state: BranchState }
   | { type: 'log'; branch: string; line: string }
   | { type: 'done'; summary: Summary }
@@ -36,7 +37,7 @@ function reducer(state: AppState, action: Action): AppState {
     case 'init': {
       const states: Record<string, BranchState> = {}
       for (const s of action.states) states[s.branch] = s
-      return { repo: action.repo, branches: action.branches, states, logs: action.logs, summary: null }
+      return { repo: action.repo, registryUrl: action.registryUrl, branches: action.branches, states, logs: action.logs, summary: null }
     }
     case 'update':
       return { ...state, states: { ...state.states, [action.state.branch]: action.state } }
@@ -51,7 +52,7 @@ function reducer(state: AppState, action: Action): AppState {
   }
 }
 
-const initialState: AppState = { repo: '', branches: [], states: {}, logs: {}, summary: null }
+const initialState: AppState = { repo: '', registryUrl: '', branches: [], states: {}, logs: {}, summary: null }
 
 const PHASE_COLOR: Record<Phase, string> = {
   queued:   '#475569',
@@ -147,14 +148,14 @@ export default function App() {
       try {
         const msg = JSON.parse(e.data) as { event: string; data: unknown }
         if (msg.event === 'init') {
-          const d = msg.data as { repo: string; branches: string[]; states: BranchState[]; logs: Record<string, string[]> }
+          const d = msg.data as { repo: string; registryUrl?: string; branches: string[]; states: BranchState[]; logs: Record<string, string[]> }
           buildStartsRef.current = {}
           for (const s of d.states) {
             if (ACTIVE_PHASES.includes(s.phase)) {
               buildStartsRef.current[s.branch] = Date.now() - (s.elapsedMs ?? 0)
             }
           }
-          dispatch({ type: 'init', repo: d.repo, branches: d.branches, states: d.states, logs: d.logs ?? {} })
+          dispatch({ type: 'init', repo: d.repo, registryUrl: d.registryUrl ?? '', branches: d.branches, states: d.states, logs: d.logs ?? {} })
         } else if (msg.event === 'update') {
           const s = msg.data as BranchState
           if (ACTIVE_PHASES.includes(s.phase)) {
@@ -189,6 +190,7 @@ export default function App() {
           <h1 className="title">moloko</h1>
           <div className="header-meta">
             {state.repo && <span className="repo-url">{state.repo}</span>}
+            {state.registryUrl && <span className="registry-url">registry: {state.registryUrl}</span>}
             <span className="progress-label">
               {state.summary
                 ? `${state.summary.succeeded} ok, ${state.summary.failed} failed — ${formatMs(state.summary.elapsedMs)}`

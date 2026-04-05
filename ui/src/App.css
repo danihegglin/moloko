@@ -83,6 +83,13 @@ body {
   max-width: 400px;
 }
 
+.registry-url {
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, monospace;
+  font-size: 11px;
+  color: #8b5cf6;
+  white-space: nowrap;
+}
+
 .progress-label {
   font-size: 13px;
   color: var(--muted);

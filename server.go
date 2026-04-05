@@ -49,23 +49,25 @@ type LogLine struct {
 
 // Hub manages SSE clients and branch build state.
 type Hub struct {
-	repo     string
-	branches []string
-	state    map[string]BranchState
-	logs     map[string][]string
-	clients  map[chan string]struct{}
-	summary  *Summary
-	mu       sync.Mutex
+	repo        string
+	registryURL string
+	branches    []string
+	state       map[string]BranchState
+	logs        map[string][]string
+	clients     map[chan string]struct{}
+	summary     *Summary
+	mu          sync.Mutex
 }
 
 // NewHub creates a Hub with all branches initialised as PhaseQueued.
-func NewHub(repo string, branches []string) *Hub {
+func NewHub(repo string, branches []string, registryURL string) *Hub {
 	h := &Hub{
-		repo:     repo,
-		branches: branches,
-		state:    make(map[string]BranchState, len(branches)),
-		logs:     make(map[string][]string, len(branches)),
-		clients:  make(map[chan string]struct{}),
+		repo:        repo,
+		registryURL: registryURL,
+		branches:    branches,
+		state:       make(map[string]BranchState, len(branches)),
+		logs:        make(map[string][]string, len(branches)),
+		clients:     make(map[chan string]struct{}),
 	}
 	for _, b := range branches {
 		h.state[b] = BranchState{Branch: b, Phase: PhaseQueued}
@@ -124,10 +126,11 @@ func (h *Hub) ResetForCycle(allBranches []string, rebuilding map[string]bool) {
 		}
 	}
 	h.broadcast("init", initPayload{
-		Repo:     h.repo,
-		Branches: allBranches,
-		States:   states,
-		Logs:     logsCopy,
+		Repo:        h.repo,
+		RegistryURL: h.registryURL,
+		Branches:    allBranches,
+		States:      states,
+		Logs:        logsCopy,
 	})
 }
 
@@ -152,10 +155,11 @@ func (h *Hub) broadcast(event string, data any) {
 }
 
 type initPayload struct {
-	Repo     string              `json:"repo"`
-	Branches []string            `json:"branches"`
-	States   []BranchState       `json:"states"`
-	Logs     map[string][]string `json:"logs"`
+	Repo        string              `json:"repo"`
+	RegistryURL string              `json:"registryUrl,omitempty"`
+	Branches    []string            `json:"branches"`
+	States      []BranchState       `json:"states"`
+	Logs        map[string][]string `json:"logs"`
 }
 
 // subscribe registers a new SSE client and returns its channel plus an unsubscribe func.
@@ -234,6 +238,29 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+}
+
+// registryServer wraps the Registry with a graceful-shutdown HTTP server.
+type registryServer struct {
+	reg  *Registry
+	addr string
+}
+
+func (rs *registryServer) start(ctx context.Context) error {
+	srv := &http.Server{Addr: rs.addr, Handler: rs.reg}
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+	select {
+	case <-ctx.Done():
+		return srv.Shutdown(context.Background())
+	case err := <-errCh:
+		return err
 	}
 }
 

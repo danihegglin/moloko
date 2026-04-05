@@ -23,6 +23,8 @@ func main() {
 	stateFlag        := flag.String("state", ".moloko-state.json", "Path to build-state file (tracks last-built SHAs)")
 	watchFlag        := flag.Bool("watch", false, "Poll for branch changes and rebuild when commits arrive")
 	intervalFlag     := flag.String("interval", "60s", "Polling interval for --watch mode")
+	registryFlag     := flag.String("registry", "", "Start built-in OCI registry on this address, e.g. :5000 (implies --push)")
+	registryDirFlag  := flag.String("registry-dir", ".moloko-registry", "Storage directory for the built-in registry")
 	flag.Parse()
 
 	if *repoFlag == "" {
@@ -58,6 +60,29 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Built-in registry: start server, prepend host to imageBase, enable push.
+	var registryURL string
+	var reg *Registry
+	if *registryFlag != "" {
+		var err error
+		reg, err = NewRegistry(*registryDirFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: registry init: %v\n", err)
+			os.Exit(1)
+		}
+		regSrv := &registryServer{reg: reg, addr: *registryFlag}
+		go func() {
+			fmt.Printf("Built-in registry listening on %s\n", *registryFlag)
+			if err := regSrv.start(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "registry error: %v\n", err)
+				cancel()
+			}
+		}()
+		registryURL = "localhost" + *registryFlag
+		imageBase = registryURL + "/" + imageBase
+		*pushFlag = true
+	}
+
 	// Discover branches once upfront so the hub (and server) can be initialised
 	// before accepting the first client connection.
 	fmt.Printf("Querying branches for %s …\n", *repoFlag)
@@ -72,10 +97,11 @@ func main() {
 	}
 
 	state := loadState(*stateFlag)
+	state = reconcileState(ctx, branches, state, imageBase, reg)
 
 	var hub *Hub
 	if *portFlag != "" {
-		hub = NewHub(*repoFlag, branches)
+		hub = NewHub(*repoFlag, branches, registryURL)
 		go func() {
 			fmt.Printf("UI available at http://localhost%s\n", *portFlag)
 			if err := startServer(ctx, *portFlag, hub); err != nil {

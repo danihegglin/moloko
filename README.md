@@ -158,3 +158,17 @@ The `--registry` flag starts a zero-configuration OCI Distribution Spec v2 regis
 moloko --repo https://github.com/acme/api --registry :5000
 docker pull localhost:5000/api:main
 ```
+
+### Clearing the registry
+
+Delete the registry storage directory (`.moloko-registry/` by default, or whatever `--registry-dir` points to) and the build-state file:
+
+```sh
+rm -rf .moloko-registry .moloko-state.json
+```
+
+On the next run moloko will rebuild all branches and repopulate the registry from scratch. The buildx builder created for the registry is unaffected; remove it separately if needed:
+
+```sh
+docker buildx rm moloko-registry
+```

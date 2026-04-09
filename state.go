@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -27,21 +26,17 @@ func loadState(path string) BuildState {
 	return s
 }
 
-// reconcileState drops BuiltSHAs entries whose image no longer exists,
-// ensuring stale state (after a prune, registry wipe, or machine move) doesn't
-// skip rebuilds for branches that actually need one.
-func reconcileState(ctx context.Context, branches []string, state BuildState, imageBase string, reg *Registry) BuildState {
+// branchesToBuild returns branches that need a new image built.
+// A branch is included if its SHA has changed since the last build OR if its
+// image no longer exists — whichever comes first.
+func branchesToBuild(ctx context.Context, branches []string, shas map[string]string, state BuildState, imageBase string, reg *Registry) []string {
+	var build []string
 	for _, b := range branches {
-		if _, recorded := state.BuiltSHAs[b]; !recorded {
-			continue
-		}
-		image := imageBase + ":" + branchToTag(b)
-		if !imageExists(ctx, image, reg) {
-			fmt.Printf("  stale: image %s not found — will rebuild %s\n", image, b)
-			delete(state.BuiltSHAs, b)
+		if state.BuiltSHAs[b] != shas[b] || !imageExists(ctx, imageBase+":"+branchToTag(b), reg) {
+			build = append(build, b)
 		}
 	}
-	return state
+	return build
 }
 
 // imageExists reports whether the given image reference is available.

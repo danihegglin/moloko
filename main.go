@@ -123,7 +123,6 @@ func main() {
 	}
 
 	state := loadState(*stateFlag)
-	state = reconcileState(ctx, branches, state, imageBase, reg)
 
 	var hub *Hub
 	if *portFlag != "" {
@@ -137,9 +136,9 @@ func main() {
 		}()
 	}
 
-	// runCycle builds whichever branches have a new commit since the last build.
+	// runCycle builds branches whose SHA changed or whose image is missing.
 	runCycle := func(branches []string, shas map[string]string) {
-		toBuild := changedBranches(branches, shas, state)
+		toBuild := branchesToBuild(ctx, branches, shas, state, imageBase, reg)
 		if len(toBuild) == 0 {
 			fmt.Println("All branches up to date.")
 			return
@@ -234,13 +233,3 @@ func discover(ctx context.Context, repoURL, gitSSHEnv string) (branches []string
 	return branches, shas, nil
 }
 
-// changedBranches returns branches whose current SHA differs from the last built SHA.
-func changedBranches(branches []string, shas map[string]string, state BuildState) []string {
-	var changed []string
-	for _, b := range branches {
-		if state.BuiltSHAs[b] != shas[b] {
-			changed = append(changed, b)
-		}
-	}
-	return changed
-}

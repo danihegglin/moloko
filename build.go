@@ -122,21 +122,28 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	image := imageBase + ":" + branchToTag(branch)
 	res := BuildResult{Branch: branch, Image: image}
 
+	phase := func(p Phase, errMsg string) {
+		if hub != nil {
+			hub.Update(BranchState{Branch: branch, Phase: p, Image: image, ElapsedMs: time.Since(start).Milliseconds(), Error: errMsg})
+		} else {
+			fmt.Printf("[%-50s] %s\n", branch, p)
+		}
+	}
+
 	// logW streams stdout+stderr of subcommands to the hub line by line.
 	// nil in CLI mode (hub == nil) so output goes nowhere (errors still captured).
 	var logW io.Writer
 	if hub != nil {
 		logW = &lineWriter{fn: func(line string) { hub.Log(branch, line) }}
-		hub.Update(BranchState{Branch: branch, Phase: PhaseCloning, Image: image})
 	}
+
+	phase(PhaseCloning, "")
 
 	tmpDir, err := os.MkdirTemp("", "moloko-")
 	if err != nil {
 		res.Err = fmt.Errorf("mktemp: %w", err)
 		res.Elapsed = time.Since(start)
-		if hub != nil {
-			hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
-		}
+		phase(PhaseFailed, res.Err.Error())
 		return res
 	}
 	defer os.RemoveAll(tmpDir)
@@ -150,15 +157,11 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	); err != nil {
 		res.Err = fmt.Errorf("git clone: %w", err)
 		res.Elapsed = time.Since(start)
-		if hub != nil {
-			hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
-		}
+		phase(PhaseFailed, res.Err.Error())
 		return res
 	}
 
-	if hub != nil {
-		hub.Update(BranchState{Branch: branch, Phase: PhaseBuilding, Image: image, ElapsedMs: time.Since(start).Milliseconds()})
-	}
+	phase(PhaseBuilding, "")
 
 	// Acquire the docker semaphore: limits how many builds touch Docker's overlay
 	// storage simultaneously, preventing "no space left on device" under parallel load.
@@ -168,9 +171,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	case <-ctx.Done():
 		res.Err = ctx.Err()
 		res.Elapsed = time.Since(start)
-		if hub != nil {
-			hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
-		}
+		phase(PhaseFailed, res.Err.Error())
 		return res
 	}
 
@@ -213,31 +214,23 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	if buildErr != nil {
 		res.Err = fmt.Errorf("docker build: %w", buildErr)
 		res.Elapsed = time.Since(start)
-		if hub != nil {
-			hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
-		}
+		phase(PhaseFailed, res.Err.Error())
 		return res
 	}
 
 	// Separate push step only when not using buildx (buildx --push already pushed above).
 	if push && builderName == "" {
-		if hub != nil {
-			hub.Update(BranchState{Branch: branch, Phase: PhasePushing, Image: image, ElapsedMs: time.Since(start).Milliseconds()})
-		}
+		phase(PhasePushing, "")
 		if err := run(ctx, cloneDir, "", "docker", logW, "push", image); err != nil {
 			res.Err = fmt.Errorf("docker push: %w", err)
 			res.Elapsed = time.Since(start)
-			if hub != nil {
-				hub.Update(BranchState{Branch: branch, Phase: PhaseFailed, Image: image, ElapsedMs: res.Elapsed.Milliseconds(), Error: res.Err.Error()})
-			}
+			phase(PhaseFailed, res.Err.Error())
 			return res
 		}
 	}
 
 	res.Elapsed = time.Since(start)
-	if hub != nil {
-		hub.Update(BranchState{Branch: branch, Phase: PhaseDone, Image: image, ElapsedMs: res.Elapsed.Milliseconds()})
-	}
+	phase(PhaseDone, "")
 	return res
 }
 

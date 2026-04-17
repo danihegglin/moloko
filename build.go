@@ -108,6 +108,39 @@ type BuildResult struct {
 	Err     error
 }
 
+// consolePrinter reserves one terminal line per branch and updates each line
+// in place using ANSI cursor movement. Safe for concurrent use.
+type consolePrinter struct {
+	mu  sync.Mutex
+	n   int
+	pos map[string]int
+}
+
+func newConsolePrinter(branches []string) *consolePrinter {
+	cp := &consolePrinter{
+		n:   len(branches),
+		pos: make(map[string]int, len(branches)),
+	}
+	for i, b := range branches {
+		cp.pos[b] = i
+		fmt.Printf("[%-50s] queued\n", b)
+	}
+	return cp
+}
+
+// set overwrites the reserved line for branch with text.
+func (cp *consolePrinter) set(branch, text string) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	i, ok := cp.pos[branch]
+	if !ok {
+		return
+	}
+	// Move cursor up to the branch's line, clear it, write new text, move back down.
+	up := cp.n - i
+	fmt.Printf("\033[%dA\r\033[K[%-50s] %s\033[%dB\r", up, branch, text, up)
+}
+
 // buildBranch shallow-clones a branch, then acquires the docker semaphore before
 // running docker build + prune so that at most cap(dockerSem) builds run at once.
 // cacheSources lists images to pass as --cache-from to docker build; the branch's
@@ -117,33 +150,34 @@ type BuildResult struct {
 // named builder so that build and push happen in one step via BuildKit — this is
 // required when pushing to a non-localhost registry that is only reachable over
 // plain HTTP (e.g. the built-in registry on macOS/Windows).
-func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub, cacheSources []string, builderName string) BuildResult {
+func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gitSSHEnv string, push bool, dockerSem chan struct{}, hub *Hub, cp *consolePrinter, cacheSources []string, builderName string) BuildResult {
 	start := time.Now()
 	image := imageBase + ":" + branchToTag(branch)
 	res := BuildResult{Branch: branch, Image: image}
 
-	phase := func(p Phase, errMsg string) {
+	set := func(text string) { cp.set(branch, text) }
+
+	updateHub := func(p Phase, errMsg string) {
 		if hub != nil {
 			hub.Update(BranchState{Branch: branch, Phase: p, Image: image, ElapsedMs: time.Since(start).Milliseconds(), Error: errMsg})
-		} else {
-			fmt.Printf("[%-50s] %s\n", branch, p)
 		}
 	}
 
-	// logW streams stdout+stderr of subcommands to the hub line by line.
-	// nil in CLI mode (hub == nil) so output goes nowhere (errors still captured).
+	// logW streams stdout+stderr of subcommands to the hub in UI mode.
 	var logW io.Writer
 	if hub != nil {
 		logW = &lineWriter{fn: func(line string) { hub.Log(branch, line) }}
 	}
 
-	phase(PhaseCloning, "")
+	updateHub(PhaseCloning, "")
+	set("cloning")
 
 	tmpDir, err := os.MkdirTemp("", "moloko-")
 	if err != nil {
 		res.Err = fmt.Errorf("mktemp: %w", err)
 		res.Elapsed = time.Since(start)
-		phase(PhaseFailed, res.Err.Error())
+		updateHub(PhaseFailed, res.Err.Error())
+		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
 		return res
 	}
 	defer os.RemoveAll(tmpDir)
@@ -157,11 +191,29 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	); err != nil {
 		res.Err = fmt.Errorf("git clone: %w", err)
 		res.Elapsed = time.Since(start)
-		phase(PhaseFailed, res.Err.Error())
+		updateHub(PhaseFailed, res.Err.Error())
+		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
 		return res
 	}
 
-	phase(PhaseBuilding, "")
+	updateHub(PhaseBuilding, "")
+	set("building")
+
+	// Tick elapsed time in place every second while building.
+	buildStart := time.Now()
+	stopTicker := make(chan struct{})
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				set(fmt.Sprintf("building %s", time.Since(buildStart).Round(time.Second)))
+			case <-stopTicker:
+				return
+			}
+		}
+	}()
 
 	// Acquire the docker semaphore: limits how many builds touch Docker's overlay
 	// storage simultaneously, preventing "no space left on device" under parallel load.
@@ -169,9 +221,11 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	select {
 	case dockerSem <- struct{}{}:
 	case <-ctx.Done():
+		close(stopTicker)
 		res.Err = ctx.Err()
 		res.Elapsed = time.Since(start)
-		phase(PhaseFailed, res.Err.Error())
+		updateHub(PhaseFailed, res.Err.Error())
+		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
 		return res
 	}
 
@@ -210,27 +264,32 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 	// starts with freed space. Active layers are pinned and won't be removed.
 	_ = run(ctx, "", "", "docker", nil, "builder", "prune", "-f")
 	<-dockerSem
+	close(stopTicker)
 
 	if buildErr != nil {
 		res.Err = fmt.Errorf("docker build: %w", buildErr)
 		res.Elapsed = time.Since(start)
-		phase(PhaseFailed, res.Err.Error())
+		updateHub(PhaseFailed, res.Err.Error())
+		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
 		return res
 	}
 
 	// Separate push step only when not using buildx (buildx --push already pushed above).
 	if push && builderName == "" {
-		phase(PhasePushing, "")
+		updateHub(PhasePushing, "")
+		set("pushing")
 		if err := run(ctx, cloneDir, "", "docker", logW, "push", image); err != nil {
 			res.Err = fmt.Errorf("docker push: %w", err)
 			res.Elapsed = time.Since(start)
-			phase(PhaseFailed, res.Err.Error())
+			updateHub(PhaseFailed, res.Err.Error())
+			set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
 			return res
 		}
 	}
 
 	res.Elapsed = time.Since(start)
-	phase(PhaseDone, "")
+	updateHub(PhaseDone, "")
+	set(fmt.Sprintf("OK  -> %s (%v)", image, res.Elapsed.Round(time.Millisecond)))
 	return res
 }
 
@@ -286,15 +345,6 @@ func run(ctx context.Context, dir, extraEnv, name string, out io.Writer, args ..
 	return nil
 }
 
-// printResult logs a build result to stdout in CLI mode.
-func printResult(r BuildResult) {
-	if r.Err != nil {
-		fmt.Printf("[FAIL] %-50s (%v) %v\n", r.Branch, r.Elapsed.Round(time.Millisecond), r.Err)
-	} else {
-		fmt.Printf("[ OK ] %-50s -> %s (%v)\n", r.Branch, r.Image, r.Elapsed.Round(time.Millisecond))
-	}
-}
-
 // buildAll builds all branches in two phases:
 //
 //  1. Primary branches (main, master) are built sequentially first. Their
@@ -304,6 +354,7 @@ func printResult(r BuildResult) {
 //     --cache-from sources so dependency layers are reused without re-downloading.
 func buildAll(ctx context.Context, repoURL string, branches []string, imageBase, dockerfile, gitSSHEnv string, push bool, numWorkers, numBuildWorkers int, hub *Hub, builderName string) []BuildResult {
 	dockerSem := make(chan struct{}, numBuildWorkers)
+	cp := newConsolePrinter(branches)
 
 	var primary, feature []string
 	for _, b := range branches {
@@ -319,10 +370,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 	// Phase 1 — primary branches, sequential, no external cache sources yet.
 	var cacheImages []string
 	for _, b := range primary {
-		r := buildBranch(ctx, repoURL, b, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, nil, builderName)
-		if hub == nil {
-			printResult(r)
-		}
+		r := buildBranch(ctx, repoURL, b, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cp, nil, builderName)
 		results = append(results, r)
 		if r.Err == nil {
 			cacheImages = append(cacheImages, r.Image)
@@ -347,11 +395,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 		go func() {
 			defer wg.Done()
 			for branch := range jobs {
-				r := buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cacheImages, builderName)
-				if hub == nil {
-					printResult(r)
-				}
-				resultsCh <- r
+				resultsCh <- buildBranch(ctx, repoURL, branch, imageBase, dockerfile, gitSSHEnv, push, dockerSem, hub, cp, cacheImages, builderName)
 			}
 		}()
 	}

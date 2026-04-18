@@ -177,7 +177,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		res.Err = fmt.Errorf("mktemp: %w", err)
 		res.Elapsed = time.Since(start)
 		updateHub(PhaseFailed, res.Err.Error())
-		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
+		set(fmt.Sprintf("FAIL (%v)", res.Elapsed.Round(time.Millisecond)))
 		return res
 	}
 	defer os.RemoveAll(tmpDir)
@@ -192,7 +192,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		res.Err = fmt.Errorf("git clone: %w", err)
 		res.Elapsed = time.Since(start)
 		updateHub(PhaseFailed, res.Err.Error())
-		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
+		set(fmt.Sprintf("FAIL (%v)", res.Elapsed.Round(time.Millisecond)))
 		return res
 	}
 
@@ -225,7 +225,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		res.Err = ctx.Err()
 		res.Elapsed = time.Since(start)
 		updateHub(PhaseFailed, res.Err.Error())
-		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
+		set(fmt.Sprintf("FAIL (%v)", res.Elapsed.Round(time.Millisecond)))
 		return res
 	}
 
@@ -270,7 +270,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 		res.Err = fmt.Errorf("docker build: %w", buildErr)
 		res.Elapsed = time.Since(start)
 		updateHub(PhaseFailed, res.Err.Error())
-		set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
+		set(fmt.Sprintf("FAIL (%v)", res.Elapsed.Round(time.Millisecond)))
 		return res
 	}
 
@@ -282,7 +282,7 @@ func buildBranch(ctx context.Context, repoURL, branch, imageBase, dockerfile, gi
 			res.Err = fmt.Errorf("docker push: %w", err)
 			res.Elapsed = time.Since(start)
 			updateHub(PhaseFailed, res.Err.Error())
-			set(fmt.Sprintf("FAIL (%v) %v", res.Elapsed.Round(time.Millisecond), res.Err))
+			set(fmt.Sprintf("FAIL (%v)", res.Elapsed.Round(time.Millisecond)))
 			return res
 		}
 	}
@@ -345,6 +345,18 @@ func run(ctx context.Context, dir, extraEnv, name string, out io.Writer, args ..
 	return nil
 }
 
+// printFailLogs prints the full error detail for any failed builds,
+// appearing below the consolePrinter block once all builds have finished.
+// run() appends the command's stderr to the error, so the output already
+// contains the exact reason the step failed.
+func printFailLogs(results []BuildResult) {
+	for _, r := range results {
+		if r.Err != nil {
+			fmt.Printf("\n--- %s ---\n%v\n", r.Branch, r.Err)
+		}
+	}
+}
+
 // buildAll builds all branches in two phases:
 //
 //  1. Primary branches (main, master) are built sequentially first. Their
@@ -378,6 +390,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 	}
 
 	if len(feature) == 0 {
+		printFailLogs(results)
 		return results
 	}
 
@@ -406,5 +419,7 @@ func buildAll(ctx context.Context, repoURL string, branches []string, imageBase,
 	for r := range resultsCh {
 		results = append(results, r)
 	}
+
+	printFailLogs(results)
 	return results
 }

@@ -44,6 +44,10 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: SSH key not found: %s\n", *keyFlag)
 			os.Exit(1)
 		}
+		if err := ensureKeyLoaded(*keyFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "error: ssh-add %s: %v\n", *keyFlag, err)
+			os.Exit(1)
+		}
 		gitSSHEnv = sshEnv(*keyFlag)
 	}
 

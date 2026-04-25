@@ -60,6 +60,45 @@ func sshEnv(keyPath string) string {
 	)
 }
 
+// ensureKeyLoaded adds keyPath to the running ssh-agent if it isn't already
+// loaded. Needed because sshEnv uses BatchMode=yes, which fails on encrypted
+// keys unless the agent already holds them. No-op if no agent is reachable.
+func ensureKeyLoaded(keyPath string) error {
+	if os.Getenv("SSH_AUTH_SOCK") == "" {
+		return nil
+	}
+	fp, err := keyFingerprint(keyPath)
+	if err != nil {
+		return err
+	}
+	out, err := exec.Command("ssh-add", "-l").Output()
+	// ssh-add -l: exit 0 = list, 1 = no identities, 2 = no agent.
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 2 {
+		return nil
+	}
+	if err == nil && bytes.Contains(out, []byte(fp)) {
+		return nil
+	}
+	cmd := exec.Command("ssh-add", keyPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// keyFingerprint returns the SHA256 fingerprint of an SSH key file.
+func keyFingerprint(keyPath string) (string, error) {
+	out, err := exec.Command("ssh-keygen", "-lf", keyPath).Output()
+	if err != nil {
+		return "", fmt.Errorf("ssh-keygen -lf %s: %w", keyPath, err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) < 2 {
+		return "", fmt.Errorf("unexpected ssh-keygen output: %q", out)
+	}
+	return fields[1], nil
+}
+
 // RemoteBranch is a branch name paired with its current tip commit SHA.
 type RemoteBranch struct {
 	Name string

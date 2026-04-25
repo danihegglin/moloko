@@ -86,21 +86,28 @@ func main() {
 		// builder whose buildkitd.toml marks our registry as plain-HTTP,
 		// then use `docker buildx build --push` to combine build and push
 		// in one step entirely inside Docker's VM.
-		if err := setupBuildxBuilder(*registryDirFlag, registryURL); err != nil {
-			fmt.Fprintf(os.Stderr, "error: buildx builder setup: %v\n", err)
-			os.Exit(1)
-		}
-		builderName = buildxBuilderName
+		//
+		// On Linux dockerd runs natively, treats 127.0.0.0/8 (and ::1/128) as
+		// insecure registries by default, and can push to localhost:N over HTTP
+		// directly — so we skip the buildx-container builder and the daemon
+		// patching, and let the build fall through to `docker build` + `docker push`.
+		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if err := setupBuildxBuilder(*registryDirFlag, registryURL); err != nil {
+				fmt.Fprintf(os.Stderr, "error: buildx builder setup: %v\n", err)
+				os.Exit(1)
+			}
+			builderName = buildxBuilderName
 
-		// Configure the Docker daemon's insecure-registries so that plain
-		// `docker pull` works. We write directly into the VM's daemon.json and
-		// reload dockerd in one step — no Docker Desktop restart needed.
-		fmt.Printf("Configuring Docker daemon for registry pull support… ")
-		if err := configureDockerPull(registryURL); err != nil {
-			fmt.Fprintf(os.Stderr, "\nwarning: daemon config failed: %v\n", err)
-			fmt.Fprintf(os.Stderr, "To enable `docker pull`, add %q to insecure-registries in\nDocker Desktop → Settings → Docker Engine, then Apply & Restart.\n", registryURL)
-		} else {
-			fmt.Println("done.")
+			// Configure the Docker daemon's insecure-registries so that plain
+			// `docker pull` works. We write directly into the VM's daemon.json and
+			// reload dockerd in one step — no Docker Desktop restart needed.
+			fmt.Printf("Configuring Docker daemon for registry pull support… ")
+			if err := configureDockerPull(registryURL); err != nil {
+				fmt.Fprintf(os.Stderr, "\nwarning: daemon config failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "To enable `docker pull`, add %q to insecure-registries in\nDocker Desktop → Settings → Docker Engine, then Apply & Restart.\n", registryURL)
+			} else {
+				fmt.Println("done.")
+			}
 		}
 
 		regSrv := &registryServer{reg: reg, addr: *registryFlag}

@@ -42,6 +42,30 @@ Check a file locally with `moloko validate [.moloko.yml]`.
 
 Every step gets these environment variables: `CI`, `MOLOKO_RUN_ID`, `MOLOKO_JOB`, `MOLOKO_REF`, `MOLOKO_SHA`, `MOLOKO_SHARD_INDEX` (0-based) and `MOLOKO_SHARD_TOTAL`.
 
+## Deploy agents
+
+Agents run on the servers you deploy to. Each one **dials out** to moloko over a WebSocket and keeps that connection open, so target servers need no inbound ports, SSH keys or firewall rules. Deploy instructions and logs travel over that connection.
+
+1. In the dashboard, go to **Agents**, then **Add agent**. Give it a name and labels such as `prod, eu`, and copy the token. It is shown only once, and only its hash is stored.
+2. On the target server, run the same binary in agent mode:
+   ```sh
+   MOLOKO_AGENT_TOKEN=mlk_… moloko agent --server wss://moloko.example.ts.net/api/agents/connect --workdir /srv/app
+   ```
+   The agent reconnects with backoff, and pings every 20s keep idle connections alive through proxies.
+3. Target agents from a pipeline by label. The job runs on **every** connected agent that has all the listed labels, in parallel:
+   ```yaml
+   deploy:
+     needs: [package]
+     agent: prod            # or [prod, eu]
+     steps:
+       - docker compose pull && docker compose up -d
+   ```
+   The job fails if no matching agent is connected, or if an agent disconnects partway through. Agent jobs don't use a local executor slot.
+
+**Reaching the server.** When moloko runs on a Mac mini behind NAT, agents still need a URL that reaches it:
+- **Tailscale (recommended).** Install it on the build machine and on the targets, then use the MagicDNS name. The traffic is end-to-end WireGuard and is never exposed to the internet. `tailscale serve` adds HTTPS.
+- **Cloudflare Tunnel.** Use it when you also need a public URL, for example for GitHub webhooks. Until moloko has auth, publish only `/api/agents/connect` and `/api/webhooks/github`, never the dashboard or the rest of the API.
+
 ## How it stays fast
 
 - **Git mirror plus worktrees.** Each project keeps one local mirror. A run does an incremental `git fetch`, and each job checks out with `git worktree add`, with no network clone per job.
@@ -61,6 +85,8 @@ Every step gets these environment variables: `CI`, `MOLOKO_RUN_ID`, `MOLOKO_JOB`
 | `POST /api/runs/:id/cancel` | cancel (kills the step's whole process group) |
 | `GET /api/jobs/:id/logs` | SSE stream: `line` events, then `end` |
 | `POST /api/webhooks/github` | GitHub push webhook (HMAC-verified) |
+| `GET/POST /api/agents`, `DELETE /api/agents/:id` | list (with online status) / register `{name, labels}` → `{token}` / revoke |
+| `GET /api/agents/connect` | agent WebSocket (`Authorization: Bearer <token>`) |
 
 ## Dashboard development
 

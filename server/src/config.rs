@@ -21,6 +21,9 @@ pub struct JobSpec {
     pub needs: Vec<String>,
     /// Run steps inside this Docker image instead of directly on the host.
     pub image: Option<String>,
+    /// Run steps on every connected deploy agent carrying all of these labels.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub agent: Vec<String>,
     /// Split the job into N parallel instances (MOLOKO_SHARD_INDEX / MOLOKO_SHARD_TOTAL).
     pub shards: Option<u32>,
     #[serde(default)]
@@ -61,6 +64,20 @@ pub struct CacheSpec {
     pub key_files: Vec<String>,
 }
 
+/// Accept `agent: prod` as well as `agent: [prod, eu]`.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 /// One schedulable unit after shard expansion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobInstance {
@@ -92,6 +109,11 @@ impl Pipeline {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 bail!("job name {name:?} may only contain letters, digits, '-' and '_'");
+            }
+            if !job.agent.is_empty()
+                && (job.image.is_some() || !job.cache.is_empty() || job.shards.is_some())
+            {
+                bail!("job {name:?}: agent jobs cannot use image, cache or shards");
             }
             if job.steps.is_empty() {
                 bail!("job {name:?} has no steps");
@@ -225,6 +247,14 @@ jobs:
         );
         let escape = "jobs:\n  a: {steps: [x], cache: [{path: ../etc}]}\n";
         assert!(Pipeline::parse(escape).is_err());
+        let agent_image = "jobs:\n  a: {steps: [x], agent: prod, image: alpine}\n";
+        assert!(Pipeline::parse(agent_image).is_err());
+        let agent = Pipeline::parse(
+            "jobs:\n  a: {steps: [x], agent: prod}\n  b: {steps: [x], agent: [prod, eu]}\n",
+        )
+        .unwrap();
+        assert_eq!(agent.jobs["a"].agent, vec!["prod"]);
+        assert_eq!(agent.jobs["b"].agent, vec!["prod", "eu"]);
         let empty = "jobs:\n  a: {steps: []}\n";
         assert!(Pipeline::parse(empty).is_err());
     }

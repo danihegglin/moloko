@@ -1,3 +1,4 @@
+mod agents;
 mod api;
 mod cache;
 mod config;
@@ -34,6 +35,18 @@ enum Command {
         /// Shared secret for GitHub webhooks. Webhooks are rejected when unset.
         #[arg(long, env = "MOLOKO_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
+    },
+    /// Run a deploy agent on a target server. It connects out to the moloko server.
+    Agent {
+        /// WebSocket URL of the server, e.g. wss://moloko.example.ts.net/api/agents/connect
+        #[arg(long, env = "MOLOKO_SERVER")]
+        server: String,
+        /// Agent token from the dashboard (Agents → Add agent).
+        #[arg(long, env = "MOLOKO_AGENT_TOKEN", hide_env_values = true)]
+        token: String,
+        /// Directory deploy steps run in.
+        #[arg(long, env = "MOLOKO_WORKDIR", default_value = ".")]
+        workdir: PathBuf,
     },
     /// Check a .moloko.yml and print the job graph.
     Validate {
@@ -75,6 +88,13 @@ async fn main() -> Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+        }
+        Command::Agent {
+            server,
+            token,
+            workdir,
+        } => {
+            agents::run_agent(server, token, workdir).await?;
         }
         Command::Validate { file } => {
             let pipeline = config::Pipeline::parse(&std::fs::read_to_string(&file)?)?;

@@ -3,11 +3,12 @@
 use crate::engine::Engine;
 use crate::logs::Subscription;
 use axum::body::Bytes;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use hmac::{Hmac, KeyInit, Mac};
@@ -33,6 +34,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/{id}/cancel", post(cancel_run))
         .route("/api/jobs/{id}/logs", get(job_logs))
         .route("/api/webhooks/github", post(github_webhook))
+        .route("/api/agents", get(list_agents).post(create_agent))
+        .route("/api/agents/{id}", delete(delete_agent))
+        .route("/api/agents/connect", get(agent_connect))
         .fallback(static_files)
         .with_state(state)
 }
@@ -172,6 +176,88 @@ async fn job_logs(
         yield Ok(Event::default().event("end").data(""));
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn list_agents(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let online = s.engine.agents.presence();
+    let agents: Vec<_> = s
+        .engine
+        .db
+        .agents()?
+        .into_iter()
+        .map(|a| {
+            let presence = online.get(&a.id).cloned();
+            json!({ "agent": a, "online": presence.is_some(), "presence": presence })
+        })
+        .collect();
+    Ok(Json(agents))
+}
+
+#[derive(Deserialize)]
+struct NewAgent {
+    name: String,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+/// Register an agent. The token is returned once and only its hash is stored.
+async fn create_agent(
+    State(s): State<AppState>,
+    Json(a): Json<NewAgent>,
+) -> ApiResult<impl IntoResponse> {
+    let name = a.name.trim();
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
+    }
+    let labels: Vec<String> = a
+        .labels
+        .iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let token = crate::agents::new_token();
+    let id = s
+        .engine
+        .db
+        .create_agent(name, &labels, &crate::agents::hash_token(&token))
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "token": token })),
+    ))
+}
+
+async fn delete_agent(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    if s.engine.db.delete_agent(id)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
+}
+
+/// Agents dial in here with `Authorization: Bearer <token>`.
+async fn agent_connect(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "missing bearer token".into()))?;
+    let agent = s
+        .engine
+        .db
+        .agent_by_token(&crate::agents::hash_token(token))?
+        .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "unknown agent token".into()))?;
+    let engine = s.engine.clone();
+    Ok(ws.on_upgrade(move |socket| async move {
+        engine.agents.serve(socket, agent, engine.db.clone()).await
+    }))
 }
 
 /// Reduce clone/html URLs to `host/owner/repo` so ssh and https forms of one repo match.

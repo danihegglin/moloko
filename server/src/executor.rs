@@ -63,7 +63,7 @@ impl Executor {
         script: &str,
         workspace: &Path,
         env: &[(String, String)],
-        log: &JobLog,
+        log: &(dyn Fn(&str) + Sync),
         cancel: &CancellationToken,
     ) -> Result<StepResult> {
         let mut cmd = match self {
@@ -116,9 +116,9 @@ impl Executor {
     }
 }
 
-async fn pump(stream: impl AsyncRead + Unpin, log: &JobLog) {
+async fn pump(stream: impl AsyncRead + Unpin, log: &(dyn Fn(&str) + Sync)) {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        log.line(&line);
+        log(&line);
     }
 }

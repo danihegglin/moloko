@@ -70,6 +70,26 @@ pub struct Job {
     pub finished_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct Agent {
+    pub id: i64,
+    pub name: String,
+    pub labels: Vec<String>,
+    pub created_at: i64,
+    pub last_seen: Option<i64>,
+}
+
+fn map_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
+    let labels: String = r.get(2)?;
+    Ok(Agent {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        labels: serde_json::from_str(&labels).unwrap_or_default(),
+        created_at: r.get(3)?,
+        last_seen: r.get(4)?,
+    })
+}
+
 pub struct Db(Mutex<Connection>);
 
 const SCHEMA: &str = r#"
@@ -105,6 +125,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id);
+CREATE TABLE IF NOT EXISTS agents (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    labels TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    last_seen INTEGER
+);
 "#;
 
 const RUN_COLS: &str = "r.id, r.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at";
@@ -284,5 +312,47 @@ impl Db {
                 .optional()?
                 .is_some(),
         )
+    }
+
+    pub fn create_agent(&self, name: &str, labels: &[String], token_hash: &str) -> Result<i64> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO agents (name, labels, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![name, serde_json::to_string(labels)?, token_hash, now_ms()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn agents(&self) -> Result<Vec<Agent>> {
+        let c = self.conn();
+        let mut st =
+            c.prepare("SELECT id, name, labels, created_at, last_seen FROM agents ORDER BY name")?;
+        let rows = st.query_map([], map_agent)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn agent_by_token(&self, token_hash: &str) -> Result<Option<Agent>> {
+        let c = self.conn();
+        Ok(c.query_row(
+            "SELECT id, name, labels, created_at, last_seen FROM agents WHERE token_hash = ?1",
+            [token_hash],
+            map_agent,
+        )
+        .optional()?)
+    }
+
+    pub fn touch_agent(&self, id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET last_seen = ?2 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_agent(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM agents WHERE id = ?1", [id])?
+            > 0)
     }
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, ago, duration, isActive, shortRef, type Job, type Project, type Status } from './api'
+import { api, ago, type AgentRow, duration, isActive, shortRef, type Job, type Project, type Status } from './api'
 
 // Hash routes: #/ (runs) and #/runs/:id
 function useRoute() {
@@ -10,7 +10,8 @@ function useRoute() {
     return () => removeEventListener('hashchange', on)
   }, [])
   const m = hash.match(/^#\/runs\/(\d+)/)
-  return m ? { page: 'run' as const, id: Number(m[1]) } : { page: 'runs' as const }
+  if (m) return { page: 'run' as const, id: Number(m[1]) }
+  return hash.startsWith('#/agents') ? { page: 'agents' as const } : { page: 'runs' as const }
 }
 
 /** Poll `load` every `ms` (and immediately); stops polling while `active` is false. */
@@ -63,9 +64,18 @@ export default function App() {
         <a href="#/" className="logo">
           moloko
         </a>
-        <span className="tagline">build server</span>
+        <nav>
+          <a href="#/" className={route.page !== 'agents' ? 'active' : ''}>
+            Runs
+          </a>
+          <a href="#/agents" className={route.page === 'agents' ? 'active' : ''}>
+            Agents
+          </a>
+        </nav>
       </header>
-      <main>{route.page === 'run' ? <RunPage id={route.id} /> : <RunsPage />}</main>
+      <main>
+        {route.page === 'run' ? <RunPage id={route.id} /> : route.page === 'agents' ? <AgentsPage /> : <RunsPage />}
+      </main>
     </div>
   )
 }
@@ -323,5 +333,119 @@ function LogView({ job }: { job: Job }) {
         ))}
       </div>
     </section>
+  )
+}
+
+function AgentsPage() {
+  const [version, setVersion] = useState(0)
+  const agents = usePoll(api.agents, 3000, [version])
+  const [created, setCreated] = useState<{ name: string; token: string } | null>(null)
+  const now = useNow(5000)
+  const refresh = () => setVersion((v) => v + 1)
+
+  return (
+    <>
+      <section className="toolbar">
+        <AddAgent
+          onCreated={(name, token) => {
+            setCreated({ name, token })
+            refresh()
+          }}
+        />
+      </section>
+      {created && <AgentToken {...created} onClose={() => setCreated(null)} />}
+      {agents.error && <p className="error">{agents.error}</p>}
+      {agents.data && agents.data.length === 0 && !created && (
+        <div className="empty">
+          <p>No deploy agents yet.</p>
+          <p className="muted">
+            Agents run on your servers and connect out to moloko, so targets need no open ports. Jobs with{' '}
+            <code>agent: &lt;label&gt;</code> run on every connected agent with that label.
+          </p>
+        </div>
+      )}
+      <table className="runs">
+        <tbody>
+          {agents.data?.map((row) => (
+            <AgentLine key={row.agent.id} row={row} now={now} onDeleted={refresh} />
+          ))}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+function AgentLine({ row, now, onDeleted }: { row: AgentRow; now: number; onDeleted: () => void }) {
+  const { agent, online, presence } = row
+  const remove = async () => {
+    if (!confirm(`Delete agent ${agent.name}? Its token stops working immediately.`)) return
+    await api.deleteAgent(agent.id).catch(() => {})
+    onDeleted()
+  }
+  return (
+    <tr className="static">
+      <td className="num">
+        <span className={`dot ${online ? 'online' : ''}`} title={online ? 'connected' : 'offline'} />
+      </td>
+      <td>
+        <strong>{agent.name}</strong>
+        {agent.labels.map((l) => (
+          <span key={l} className="label">
+            {l}
+          </span>
+        ))}
+      </td>
+      <td className="muted">{presence ? `${presence.hostname} · ${presence.os} · v${presence.version}` : ''}</td>
+      <td className="muted right">
+        {online ? 'connected' : agent.last_seen ? `seen ${ago(agent.last_seen, now)}` : 'never connected'}
+      </td>
+      <td className="right">
+        <button className="danger small" onClick={remove}>
+          Delete
+        </button>
+      </td>
+    </tr>
+  )
+}
+
+function AddAgent({ onCreated }: { onCreated: (name: string, token: string) => void }) {
+  const [name, setName] = useState('')
+  const [labels, setLabels] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    try {
+      const list = labels.split(',').map((l) => l.trim()).filter(Boolean)
+      const { token } = await api.createAgent(name, list)
+      onCreated(name, token)
+      setName('')
+      setLabels('')
+      setError(null)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+  return (
+    <form className="inline" onSubmit={submit}>
+      <input placeholder="agent name, e.g. web1" value={name} onChange={(e) => setName(e.target.value)} required />
+      <input placeholder="labels, e.g. prod, eu" value={labels} onChange={(e) => setLabels(e.target.value)} />
+      <button type="submit">Add agent</button>
+      {error && <span className="error">{error}</span>}
+    </form>
+  )
+}
+
+function AgentToken({ name, token, onClose }: { name: string; token: string; onClose: () => void }) {
+  const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/agents/connect`
+  return (
+    <div className="token-box">
+      <p>
+        <strong>{name}</strong> created. Copy the token now, because it won't be shown again. Run this on the target server:
+      </p>
+      <pre>{`MOLOKO_AGENT_TOKEN=${token} \\\n  moloko agent --server ${wsUrl}`}</pre>
+      <button className="secondary small" onClick={onClose}>
+        Done
+      </button>
+    </div>
   )
 }

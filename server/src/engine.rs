@@ -1,6 +1,7 @@
 //! Turns a trigger into a run: sync the repo, read `.moloko.yml`, then execute the job graph
 //! with as much parallelism as the executor slots allow.
 
+use crate::agents::AgentHub;
 use crate::cache::{self, Cache};
 use crate::config::{JobInstance, JobSpec, PIPELINE_FILE, Pipeline};
 use crate::db::{Db, Status};
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 pub struct Engine {
     pub db: Arc<Db>,
     pub logs: Arc<LogHub>,
+    pub agents: AgentHub,
     git: GitCache,
     cache: Cache,
     work_dir: PathBuf,
@@ -45,6 +47,7 @@ impl Engine {
         Ok(Arc::new(Engine {
             db: Arc::new(Db::open(&data_dir.join("moloko.db"))?),
             logs: Arc::new(LogHub::new(&data_dir.join("logs"))),
+            agents: AgentHub::default(),
             git: GitCache::new(&data_dir.join("git")),
             cache: Cache::new(&data_dir.join("cache")),
             work_dir,
@@ -207,12 +210,18 @@ impl Engine {
     }
 
     async fn run_job(&self, ctx: &RunCtx, job_id: i64, inst: &JobInstance) -> Status {
-        let _permit = tokio::select! {
-            p = self.slots.clone().acquire_owned() => p.expect("semaphore closed"),
-            _ = ctx.cancel.cancelled() => {
-                let _ = self.db.finish_job(job_id, Status::Cancelled, None);
-                return Status::Cancelled;
+        let spec = &ctx.pipeline.jobs[&inst.base];
+        // Agent jobs run elsewhere, so they don't take a local executor slot.
+        let _permit = if spec.agent.is_empty() {
+            tokio::select! {
+                p = self.slots.clone().acquire_owned() => Some(p.expect("semaphore closed")),
+                _ = ctx.cancel.cancelled() => {
+                    let _ = self.db.finish_job(job_id, Status::Cancelled, None);
+                    return Status::Cancelled;
+                }
             }
+        } else {
+            None
         };
         let log = match self.logs.open(job_id) {
             Ok(l) => l,
@@ -224,19 +233,25 @@ impl Engine {
         };
         // Open the log before marking the job running, so a viewer that sees `running` can stream it.
         let _ = self.db.start_job(job_id);
-        let spec = &ctx.pipeline.jobs[&inst.base];
         let ws = self.work_dir.join(job_id.to_string());
         let started = Instant::now();
+        let env = job_env(ctx, inst, spec);
 
-        let (status, code) = match self.git.checkout(ctx.project_id, &ctx.sha, &ws).await {
-            Ok(()) => {
-                let r = self.run_steps(ctx, job_id, inst, spec, &ws, &log).await;
-                self.git.remove(ctx.project_id, &ws).await;
-                r
-            }
-            Err(e) => {
-                log.line(&format!("✗ checkout failed: {e:#}"));
-                (Status::Failed, None)
+        let (status, code) = if !spec.agent.is_empty() {
+            self.run_on_agents(ctx, spec, &env, &log).await
+        } else {
+            match self.git.checkout(ctx.project_id, &ctx.sha, &ws).await {
+                Ok(()) => {
+                    let r = self
+                        .run_steps(ctx, job_id, inst, spec, &env, &ws, &log)
+                        .await;
+                    self.git.remove(ctx.project_id, &ws).await;
+                    r
+                }
+                Err(e) => {
+                    log.line(&format!("✗ checkout failed: {e:#}"));
+                    (Status::Failed, None)
+                }
             }
         };
         log.line(&format!(
@@ -250,28 +265,17 @@ impl Engine {
         status
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_steps(
         &self,
         ctx: &RunCtx,
         job_id: i64,
         inst: &JobInstance,
         spec: &JobSpec,
+        env: &[(String, String)],
         ws: &std::path::Path,
         log: &crate::logs::JobLog,
     ) -> (Status, Option<i32>) {
-        let mut env: Vec<(String, String)> = vec![
-            ("CI".into(), "true".into()),
-            ("MOLOKO".into(), "true".into()),
-            ("MOLOKO_RUN_ID".into(), ctx.run_id.to_string()),
-            ("MOLOKO_JOB".into(), inst.name.clone()),
-            ("MOLOKO_REF".into(), ctx.git_ref.clone()),
-            ("MOLOKO_SHA".into(), ctx.sha.clone()),
-        ];
-        let (idx, total) = inst.shard.unwrap_or((0, 1));
-        env.push(("MOLOKO_SHARD_INDEX".into(), idx.to_string()));
-        env.push(("MOLOKO_SHARD_TOTAL".into(), total.to_string()));
-        env.extend(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-
         let cache_keys: Vec<String> = spec
             .cache
             .iter()
@@ -289,8 +293,7 @@ impl Engine {
         let exec = match &spec.image {
             None => Executor::Host,
             Some(image) => {
-                match Executor::docker(image, &format!("moloko-job-{job_id}"), ws, &env, log).await
-                {
+                match Executor::docker(image, &format!("moloko-job-{job_id}"), ws, env, log).await {
                     Ok(e) => e,
                     Err(e) => {
                         log.line(&format!("✗ {e:#}"));
@@ -304,7 +307,7 @@ impl Engine {
         for step in &spec.steps {
             log.line(&format!("▶ {}", step.label()));
             match exec
-                .run_step(step.script(), ws, &env, log, &ctx.cancel)
+                .run_step(step.script(), ws, env, &|l| log.line(l), &ctx.cancel)
                 .await
             {
                 Ok(StepResult::Exited(0)) => {}
@@ -336,6 +339,71 @@ impl Engine {
         }
         result
     }
+
+    /// Run the job's steps on every matching agent in parallel; success only if all succeed.
+    async fn run_on_agents(
+        &self,
+        ctx: &RunCtx,
+        spec: &JobSpec,
+        env: &[(String, String)],
+        log: &crate::logs::JobLog,
+    ) -> (Status, Option<i32>) {
+        let targets = self.agents.matching(&spec.agent);
+        if targets.is_empty() {
+            log.line(&format!(
+                "✗ no connected agent has labels [{}]",
+                spec.agent.join(", ")
+            ));
+            return (Status::Failed, None);
+        }
+        let names: Vec<&str> = targets.iter().map(|c| c.agent.name.as_str()).collect();
+        log.line(&format!("▶ deploying to {}", names.join(", ")));
+        let results = futures_util::future::join_all(targets.iter().map(|conn| async move {
+            let name = &conn.agent.name;
+            let prefixed = |l: &str| log.line(&format!("[{name}] {l}"));
+            for step in &spec.steps {
+                prefixed(&format!("▶ {}", step.label()));
+                match self
+                    .agents
+                    .exec(conn, step.script(), env, &prefixed, &ctx.cancel)
+                    .await
+                {
+                    Ok(StepResult::Exited(0)) => {}
+                    Ok(StepResult::Exited(code)) => {
+                        prefixed(&format!("✗ step exited with code {code}"));
+                        return (Status::Failed, Some(code));
+                    }
+                    Ok(StepResult::Cancelled) => return (Status::Cancelled, None),
+                    Err(e) => {
+                        prefixed(&format!("✗ {e:#}"));
+                        return (Status::Failed, None);
+                    }
+                }
+            }
+            (Status::Success, Some(0))
+        }))
+        .await;
+        results
+            .into_iter()
+            .find(|(s, _)| *s != Status::Success)
+            .unwrap_or((Status::Success, Some(0)))
+    }
+}
+
+fn job_env(ctx: &RunCtx, inst: &JobInstance, spec: &JobSpec) -> Vec<(String, String)> {
+    let (idx, total) = inst.shard.unwrap_or((0, 1));
+    let mut env: Vec<(String, String)> = vec![
+        ("CI".into(), "true".into()),
+        ("MOLOKO".into(), "true".into()),
+        ("MOLOKO_RUN_ID".into(), ctx.run_id.to_string()),
+        ("MOLOKO_JOB".into(), inst.name.clone()),
+        ("MOLOKO_REF".into(), ctx.git_ref.clone()),
+        ("MOLOKO_SHA".into(), ctx.sha.clone()),
+        ("MOLOKO_SHARD_INDEX".into(), idx.to_string()),
+        ("MOLOKO_SHARD_TOTAL".into(), total.to_string()),
+    ];
+    env.extend(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
 }
 
 #[cfg(test)]

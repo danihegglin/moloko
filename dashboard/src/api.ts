@@ -32,6 +32,12 @@ export interface Job {
   finished_at: number | null
 }
 
+export interface AgentRow {
+  agent: { id: number; name: string; labels: string[]; created_at: number; last_seen: number | null }
+  online: boolean
+  presence: { hostname: string; os: string; version: string; connected_at: number } | null
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -42,7 +48,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     const err = await res.json().catch(() => ({ error: res.statusText }))
     throw new Error(err.error ?? res.statusText)
   }
-  return res.status === 202 ? (undefined as T) : res.json()
+  return res.status === 202 || res.status === 204 ? (undefined as T) : res.json()
 }
 
 export const api = {
@@ -55,6 +61,10 @@ export const api = {
   trigger: (projectId: number, ref: string) =>
     request<{ id: number }>('POST', `/api/projects/${projectId}/runs`, { ref }),
   cancel: (id: number) => request<void>('POST', `/api/runs/${id}/cancel`),
+  agents: () => request<AgentRow[]>('GET', '/api/agents'),
+  createAgent: (name: string, labels: string[]) =>
+    request<{ id: number; token: string }>('POST', '/api/agents', { name, labels }),
+  deleteAgent: (id: number) => request<void>('DELETE', `/api/agents/${id}`),
 }
 
 export const isActive = (s: Status) => s === 'queued' || s === 'running'

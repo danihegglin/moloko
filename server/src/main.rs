@@ -7,6 +7,7 @@ mod engine;
 mod executor;
 mod git;
 mod logs;
+mod registry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -32,6 +33,10 @@ enum Command {
         /// Maximum number of jobs running at once (default: CPU count).
         #[arg(long, env = "MOLOKO_EXECUTORS")]
         executors: Option<usize>,
+        /// Host[:port] that jobs and agents use for the built-in registry (`docker push <host>/...`).
+        /// Defaults to the listen address with `localhost` as host.
+        #[arg(long, env = "MOLOKO_REGISTRY_HOST")]
+        registry_host: Option<String>,
         /// Shared secret for GitHub webhooks. Webhooks are rejected when unset.
         #[arg(long, env = "MOLOKO_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
@@ -69,20 +74,22 @@ async fn main() -> Result<()> {
             data,
             executors,
             webhook_secret,
+            registry_host,
         } => {
             let executors = executors.unwrap_or_else(|| {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4)
             });
-            let engine = engine::Engine::new(&data, executors)?;
+            let registry_host = registry_host.unwrap_or_else(|| default_registry_host(&listen));
+            let engine = engine::Engine::new(&data, executors, &registry_host)?;
             let app = api::router(api::AppState {
                 engine,
                 webhook_secret: webhook_secret.filter(|s| !s.is_empty()),
             });
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             tracing::info!(
-                "moloko listening on http://{listen} ({executors} executors, data in {})",
+                "moloko listening on http://{listen} ({executors} executors, registry {registry_host}, data in {})",
                 data.display()
             );
             axum::serve(listener, app)
@@ -108,6 +115,14 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `127.0.0.1:8080` / `0.0.0.0:8080` -> `localhost:8080`. Docker allows plain HTTP for localhost.
+fn default_registry_host(listen: &str) -> String {
+    match listen.rsplit_once(':') {
+        Some((_, port)) => format!("localhost:{port}"),
+        None => "localhost".into(),
+    }
 }
 
 async fn shutdown() {

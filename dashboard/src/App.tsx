@@ -11,6 +11,7 @@ function useRoute() {
   }, [])
   const m = hash.match(/^#\/runs\/(\d+)/)
   if (m) return { page: 'run' as const, id: Number(m[1]) }
+  if (hash.startsWith('#/images')) return { page: 'images' as const }
   return hash.startsWith('#/agents') ? { page: 'agents' as const } : { page: 'runs' as const }
 }
 
@@ -65,16 +66,19 @@ export default function App() {
           moloko
         </a>
         <nav>
-          <a href="#/" className={route.page !== 'agents' ? 'active' : ''}>
+          <a href="#/" className={route.page === 'runs' || route.page === 'run' ? 'active' : ''}>
             Runs
           </a>
           <a href="#/agents" className={route.page === 'agents' ? 'active' : ''}>
             Agents
           </a>
+          <a href="#/images" className={route.page === 'images' ? 'active' : ''}>
+            Images
+          </a>
         </nav>
       </header>
       <main>
-        {route.page === 'run' ? <RunPage id={route.id} /> : route.page === 'agents' ? <AgentsPage /> : <RunsPage />}
+        {route.page === 'run' ? <RunPage id={route.id} /> : route.page === 'agents' ? <AgentsPage /> : route.page === 'images' ? <ImagesPage /> : <RunsPage />}
       </main>
     </div>
   )
@@ -447,5 +451,53 @@ function AgentToken({ name, token, onClose }: { name: string; token: string; onC
         Done
       </button>
     </div>
+  )
+}
+
+function ImagesPage() {
+  const images = usePoll(api.images, 5000, [])
+  const now = useNow(10000)
+  if (images.error) return <p className="error">{images.error}</p>
+  if (!images.data) return <p className="muted">Loading…</p>
+  const { registry, repositories } = images.data
+  return (
+    <>
+      <p className="muted">
+        Built-in registry at <code>{registry}</code>. Jobs push with <code>$MOLOKO_REGISTRY_TOKEN</code>, and agents pull
+        with their own token.
+      </p>
+      {repositories.length === 0 && (
+        <div className="empty">
+          <p>No images yet.</p>
+          <p className="muted">
+            In a job: <code>docker login $MOLOKO_REGISTRY -u moloko -p $MOLOKO_REGISTRY_TOKEN</code>, then{' '}
+            <code>docker push $MOLOKO_IMAGE/app:$MOLOKO_SHA</code>.
+          </p>
+        </div>
+      )}
+      {repositories.map((repo) => (
+        <section key={repo.name} className="image-repo">
+          <h2>{repo.name}</h2>
+          <table className="runs">
+            <tbody>
+              {repo.tags.map((t) => (
+                <tr key={t.tag} className="static">
+                  <td>
+                    <strong>{t.tag.length > 24 ? t.tag.slice(0, 12) : t.tag}</strong>
+                  </td>
+                  <td>
+                    <code className="sha">{t.digest.slice(7, 19)}</code>
+                  </td>
+                  <td>
+                    <code className="pull">docker pull {registry}/{repo.name}:{t.tag}</code>
+                  </td>
+                  <td className="muted right">{ago(t.updated_at, now)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      ))}
+    </>
   )
 }

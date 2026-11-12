@@ -386,7 +386,7 @@ jobs:
     steps: [echo never]
 "#;
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline)]).await;
-        let engine = Engine::new(&dir.path().join("data"), 2).unwrap();
+        let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0").unwrap();
         let pid = engine
             .db
             .create_project("demo", repo.to_str().unwrap())

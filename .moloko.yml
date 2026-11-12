@@ -1,0 +1,13 @@
+# moloko builds itself
+jobs:
+  dashboard:
+    cache: [{path: dashboard/node_modules, key_files: [dashboard/package-lock.json]}]
+    steps:
+      - run: cd dashboard && npm ci && npm run build
+  server:
+    needs: [dashboard]
+    steps:
+      - name: test
+        run: cd server && cargo test
+      - name: build
+        run: cd server && cargo build --release

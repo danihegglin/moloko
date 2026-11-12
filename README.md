@@ -1,5 +1,7 @@
 # moloko
 
+> **New:** moloko is becoming a self-hosted build server written in Rust, with a React dashboard. See [`server/README.md`](server/README.md). The Go CLI documented below stays until the server covers its features.
+
 Build Docker images for every relevant branch in a Git repository — in parallel.
 
 Moloko targets two categories of branches:

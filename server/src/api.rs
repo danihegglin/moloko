@@ -3,12 +3,13 @@
 use crate::engine::Engine;
 use crate::logs::Subscription;
 use axum::body::Bytes;
+use axum::extract::Request;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
 use hmac::{Hmac, KeyInit, Mac};
@@ -37,6 +38,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(list_agents).post(create_agent))
         .route("/api/agents/{id}", delete(delete_agent))
         .route("/api/agents/connect", get(agent_connect))
+        .route("/api/images", get(list_images))
+        .route("/v2", any(registry))
+        .route("/v2/", any(registry))
+        .route("/v2/{*rest}", any(registry))
         .fallback(static_files)
         .with_state(state)
 }
@@ -258,6 +263,25 @@ async fn agent_connect(
     Ok(ws.on_upgrade(move |socket| async move {
         engine.agents.serve(socket, agent, engine.db.clone()).await
     }))
+}
+
+async fn list_images(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(json!({
+        "registry": s.engine.registry_host,
+        "repositories": s.engine.registry.images(),
+    })))
+}
+
+/// OCI distribution API. Run tokens can push, agent tokens can pull.
+async fn registry(State(s): State<AppState>, req: Request) -> Response {
+    let db = s.engine.db.clone();
+    let access = s.engine.registry.authorize(req.headers(), |token| {
+        db.agent_by_token(&crate::agents::hash_token(token))
+            .ok()
+            .flatten()
+            .map(|a| a.name)
+    });
+    s.engine.registry.handle(req, access).await
 }
 
 /// Reduce clone/html URLs to `host/owner/repo` so ssh and https forms of one repo match.

@@ -8,6 +8,7 @@ use crate::db::{Db, Status};
 use crate::executor::{Executor, StepResult};
 use crate::git::GitCache;
 use crate::logs::LogHub;
+use crate::registry::{self, Registry};
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,6 +22,8 @@ pub struct Engine {
     pub db: Arc<Db>,
     pub logs: Arc<LogHub>,
     pub agents: AgentHub,
+    pub registry: Registry,
+    pub registry_host: String,
     git: GitCache,
     cache: Cache,
     work_dir: PathBuf,
@@ -32,14 +35,22 @@ pub struct Engine {
 struct RunCtx {
     run_id: i64,
     project_id: i64,
+    project_name: String,
     git_ref: String,
     sha: String,
     pipeline: Pipeline,
     cancel: CancellationToken,
+    /// Read-write registry credential, valid only while the run is active.
+    registry_token: String,
 }
 
 impl Engine {
-    pub fn new(data_dir: &std::path::Path, executors: usize) -> Result<Arc<Self>> {
+    /// `registry_host` is how jobs and agents address the built-in registry, e.g. `moloko.tail1234.ts.net`.
+    pub fn new(
+        data_dir: &std::path::Path,
+        executors: usize,
+        registry_host: &str,
+    ) -> Result<Arc<Self>> {
         for d in ["git", "cache", "logs", "work"] {
             std::fs::create_dir_all(data_dir.join(d))?;
         }
@@ -48,6 +59,8 @@ impl Engine {
             db: Arc::new(Db::open(&data_dir.join("moloko.db"))?),
             logs: Arc::new(LogHub::new(&data_dir.join("logs"))),
             agents: AgentHub::default(),
+            registry: Registry::new(&data_dir.join("registry"))?,
+            registry_host: registry_host.to_string(),
             git: GitCache::new(&data_dir.join("git")),
             cache: Cache::new(&data_dir.join("cache")),
             work_dir,
@@ -74,10 +87,7 @@ impl Engine {
         let this = self.clone();
         let (git_ref, sha) = (git_ref.to_string(), sha.map(str::to_string));
         tokio::spawn(async move {
-            let status = match this
-                .prepare(run_id, project_id, &project.repo_url, git_ref, sha, cancel)
-                .await
-            {
+            let status = match this.prepare(run_id, &project, git_ref, sha, cancel).await {
                 Ok(ctx) => this.execute(Arc::new(ctx)).await,
                 Err(e) => {
                     tracing::warn!(run_id, "run failed before start: {e:#}");
@@ -106,13 +116,17 @@ impl Engine {
     async fn prepare(
         &self,
         run_id: i64,
-        project_id: i64,
-        url: &str,
+        project: &crate::db::Project,
         git_ref: String,
         sha: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunCtx> {
-        let mirror = self.git.sync(project_id, url).await.context("git sync")?;
+        let project_id = project.id;
+        let mirror = self
+            .git
+            .sync(project_id, &project.repo_url)
+            .await
+            .context("git sync")?;
         let sha = match sha {
             Some(s) => s,
             None => self.git.resolve(&mirror, &git_ref).await?,
@@ -127,25 +141,31 @@ impl Engine {
         Ok(RunCtx {
             run_id,
             project_id,
+            project_name: project.name.clone(),
             git_ref,
             sha,
             pipeline,
             cancel,
+            registry_token: crate::agents::new_token(),
         })
     }
 
     async fn execute(self: &Arc<Self>, ctx: Arc<RunCtx>) -> Status {
+        self.registry.grant_run_token(&ctx.registry_token);
+        let (status, error) = match self.execute_jobs(&ctx).await {
+            Ok(s) => (s, None),
+            Err(e) => (Status::Failed, Some(format!("{e:#}"))),
+        };
+        self.registry.revoke_run_token(&ctx.registry_token);
+        let _ = self.db.finish_run(ctx.run_id, status, error.as_deref());
+        status
+    }
+
+    async fn execute_jobs(self: &Arc<Self>, ctx: &Arc<RunCtx>) -> Result<Status> {
         let mut pending: Vec<(i64, JobInstance)> = Vec::new();
         for inst in ctx.pipeline.expand() {
-            match self.db.create_job(ctx.run_id, &inst.name, &inst.needs) {
-                Ok(id) => pending.push((id, inst)),
-                Err(e) => {
-                    let _ = self
-                        .db
-                        .finish_run(ctx.run_id, Status::Failed, Some(&format!("{e:#}")));
-                    return Status::Failed;
-                }
-            }
+            let id = self.db.create_job(ctx.run_id, &inst.name, &inst.needs)?;
+            pending.push((id, inst));
         }
 
         let mut done: HashMap<String, Status> = HashMap::new();
@@ -205,8 +225,7 @@ impl Engine {
         } else {
             Status::Failed
         };
-        let _ = self.db.finish_run(ctx.run_id, status, None);
-        status
+        Ok(status)
     }
 
     async fn run_job(&self, ctx: &RunCtx, job_id: i64, inst: &JobInstance) -> Status {
@@ -235,7 +254,7 @@ impl Engine {
         let _ = self.db.start_job(job_id);
         let ws = self.work_dir.join(job_id.to_string());
         let started = Instant::now();
-        let env = job_env(ctx, inst, spec);
+        let env = job_env(ctx, inst, spec, &self.registry_host);
 
         let (status, code) = if !spec.agent.is_empty() {
             self.run_on_agents(ctx, spec, &env, &log).await
@@ -390,7 +409,12 @@ impl Engine {
     }
 }
 
-fn job_env(ctx: &RunCtx, inst: &JobInstance, spec: &JobSpec) -> Vec<(String, String)> {
+fn job_env(
+    ctx: &RunCtx,
+    inst: &JobInstance,
+    spec: &JobSpec,
+    registry_host: &str,
+) -> Vec<(String, String)> {
     let (idx, total) = inst.shard.unwrap_or((0, 1));
     let mut env: Vec<(String, String)> = vec![
         ("CI".into(), "true".into()),
@@ -401,6 +425,16 @@ fn job_env(ctx: &RunCtx, inst: &JobInstance, spec: &JobSpec) -> Vec<(String, Str
         ("MOLOKO_SHA".into(), ctx.sha.clone()),
         ("MOLOKO_SHARD_INDEX".into(), idx.to_string()),
         ("MOLOKO_SHARD_TOTAL".into(), total.to_string()),
+        ("MOLOKO_REGISTRY".into(), registry_host.to_string()),
+        ("MOLOKO_REGISTRY_USER".into(), "moloko".into()),
+        ("MOLOKO_REGISTRY_TOKEN".into(), ctx.registry_token.clone()),
+        (
+            "MOLOKO_IMAGE".into(),
+            format!(
+                "{registry_host}/{}",
+                registry::repo_component(&ctx.project_name)
+            ),
+        ),
     ];
     env.extend(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
@@ -453,7 +487,7 @@ jobs:
     steps: [echo unreachable]
 "#;
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline), ("lock", "1")]).await;
-        let engine = Engine::new(&dir.path().join("data"), 4).unwrap();
+        let engine = Engine::new(&dir.path().join("data"), 4, "localhost:0").unwrap();
         let pid = engine
             .db
             .create_project("demo", repo.to_str().unwrap())
@@ -499,7 +533,7 @@ jobs:
         let dir = tempfile::tempdir().unwrap();
         let pipeline = "jobs:\n  slow:\n    steps: [sleep 30]\n  later:\n    needs: [slow]\n    steps: [echo hi]\n";
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline)]).await;
-        let engine = Engine::new(&dir.path().join("data"), 2).unwrap();
+        let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0").unwrap();
         let pid = engine
             .db
             .create_project("demo", repo.to_str().unwrap())
@@ -535,7 +569,7 @@ jobs:
     async fn missing_pipeline_fails_run_with_error() {
         let dir = tempfile::tempdir().unwrap();
         let repo = fixture_repo(dir.path(), &[("README", "x")]).await;
-        let engine = Engine::new(&dir.path().join("data"), 1).unwrap();
+        let engine = Engine::new(&dir.path().join("data"), 1, "localhost:0").unwrap();
         let pid = engine
             .db
             .create_project("demo", repo.to_str().unwrap())

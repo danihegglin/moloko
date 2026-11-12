@@ -38,6 +38,11 @@ export interface AgentRow {
   presence: { hostname: string; os: string; version: string; connected_at: number } | null
 }
 
+export interface Images {
+  registry: string
+  repositories: { name: string; tags: { tag: string; digest: string; updated_at: number }[] }[]
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(path, {
     method,
@@ -64,6 +69,7 @@ export const api = {
   agents: () => request<AgentRow[]>('GET', '/api/agents'),
   createAgent: (name: string, labels: string[]) =>
     request<{ id: number; token: string }>('POST', '/api/agents', { name, labels }),
+  images: () => request<Images>('GET', '/api/images'),
   deleteAgent: (id: number) => request<void>('DELETE', `/api/agents/${id}`),
 }
 

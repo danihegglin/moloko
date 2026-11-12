@@ -13,6 +13,7 @@ make server                                # builds the dashboard and embeds it
 | `--data` / `MOLOKO_DATA` | `moloko-data` | SQLite DB, git mirrors, caches, logs, workspaces |
 | `--executors` / `MOLOKO_EXECUTORS` | CPU count | Max jobs running at once |
 | `--webhook-secret` / `MOLOKO_WEBHOOK_SECRET` | unset | Enables `POST /api/webhooks/github` (push events) |
+| `--registry-host` / `MOLOKO_REGISTRY_HOST` | `localhost:<port>` | The address jobs and agents use for the built-in registry, e.g. `moloko.tail1234.ts.net` |
 
 Requires `git`, and `docker` for jobs that set `image:`.
 
@@ -40,7 +41,31 @@ jobs:
 
 Check a file locally with `moloko validate [.moloko.yml]`.
 
-Every step gets these environment variables: `CI`, `MOLOKO_RUN_ID`, `MOLOKO_JOB`, `MOLOKO_REF`, `MOLOKO_SHA`, `MOLOKO_SHARD_INDEX` (0-based) and `MOLOKO_SHARD_TOTAL`.
+Every step gets these environment variables: `CI`, `MOLOKO_RUN_ID`, `MOLOKO_JOB`, `MOLOKO_REF`, `MOLOKO_SHA`, `MOLOKO_SHARD_INDEX` (0-based) and `MOLOKO_SHARD_TOTAL`. It also gets the registry variables described below: `MOLOKO_REGISTRY`, `MOLOKO_REGISTRY_USER`, `MOLOKO_REGISTRY_TOKEN` and `MOLOKO_IMAGE`.
+
+## Built-in registry
+
+moloko is also an OCI/Docker registry. It serves the Distribution v2 API at `/v2/` on the same port as everything else. Images a pipeline builds go straight into it, and deploy agents pull them from there, so there's no GHCR or Docker Hub round trip and no extra service to run.
+
+```yaml
+jobs:
+  image:
+    steps:
+      - echo "$MOLOKO_REGISTRY_TOKEN" | docker login "$MOLOKO_REGISTRY" -u "$MOLOKO_REGISTRY_USER" --password-stdin
+      - docker build -t "$MOLOKO_IMAGE/api:$MOLOKO_SHA" . && docker push "$MOLOKO_IMAGE/api:$MOLOKO_SHA"
+  deploy:
+    needs: [image]
+    agent: prod
+    steps:
+      - echo "$MOLOKO_REGISTRY_TOKEN" | docker login "$MOLOKO_REGISTRY" -u "$MOLOKO_REGISTRY_USER" --password-stdin
+      - docker pull "$MOLOKO_IMAGE/api:$MOLOKO_SHA" && docker compose up -d
+```
+
+- `MOLOKO_IMAGE` is `<registry-host>/<project name, lowercased>`.
+- **Auth.** Each run gets its own read-write token in `MOLOKO_REGISTRY_TOKEN`. The token stops working when the run ends. Agents can also pull outside a pipeline with their agent name and token, for example `docker login <host> -u web1 -p mlk_…`. Agent tokens can pull but not push. Requests without credentials get a 401.
+- **Storage.** Content-addressed under `<data>/registry`. Layers stream to disk while being hashed, and cross-repo blob mounts and Range requests are supported. The **Images** page in the dashboard lists repositories and tags with their pull commands.
+- **HTTPS.** Docker only talks plain HTTP to `localhost`. On the build machine, the default `localhost:<port>` works on Linux. For agents on other servers, and for Docker Desktop on macOS (its daemon runs in a VM), serve moloko over HTTPS and set `--registry-host` to that name. With Tailscale, run `tailscale serve --bg 8080` and set `MOLOKO_REGISTRY_HOST=<machine>.<tailnet>.ts.net`.
+- Not yet included: garbage collection of untagged blobs, and retention policies.
 
 ## Deploy agents
 
@@ -87,6 +112,8 @@ Agents run on the servers you deploy to. Each one **dials out** to moloko over a
 | `POST /api/webhooks/github` | GitHub push webhook (HMAC-verified) |
 | `GET/POST /api/agents`, `DELETE /api/agents/:id` | list (with online status) / register `{name, labels}` → `{token}` / revoke |
 | `GET /api/agents/connect` | agent WebSocket (`Authorization: Bearer <token>`) |
+| `GET /api/images` | registry repositories and tags |
+| `/v2/…` | OCI Distribution API (Basic auth: run token or `<agent>:<agent token>`) |
 
 ## Dashboard development
 

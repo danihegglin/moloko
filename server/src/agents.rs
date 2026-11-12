@@ -77,6 +77,7 @@ pub struct Connection {
     pub agent: Agent,
     presence: Mutex<Presence>,
     tx: mpsc::UnboundedSender<ToAgent>,
+    kick: CancellationToken,
     pending: Mutex<HashMap<u64, mpsc::UnboundedSender<ExecEvent>>>,
 }
 
@@ -101,6 +102,13 @@ impl AgentHub {
         v
     }
 
+    /// Close an agent's connection, e.g. after its token was revoked.
+    pub fn disconnect(&self, agent_id: i64) {
+        if let Some(c) = self.conns.lock().unwrap().remove(&agent_id) {
+            c.kick.cancel();
+        }
+    }
+
     pub fn presence(&self) -> HashMap<i64, Presence> {
         self.conns
             .lock()
@@ -122,6 +130,7 @@ impl AgentHub {
                 connected_at: crate::db::now_ms(),
             }),
             tx,
+            kick: CancellationToken::new(),
             pending: Mutex::default(),
         });
         // A reconnect replaces the previous connection for the same agent.
@@ -180,6 +189,7 @@ impl AgentHub {
         tokio::select! {
             _ = writer => {}
             _ = reader => {}
+            _ = conn.kick.cancelled() => {}
         }
 
         let mut conns = self.conns.lock().unwrap();
@@ -377,11 +387,20 @@ jobs:
 "#;
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline)]).await;
         let engine = Engine::new(&dir.path().join("data"), 2).unwrap();
-        let pid = engine.db.create_project("demo", repo.to_str().unwrap()).unwrap();
+        let pid = engine
+            .db
+            .create_project("demo", repo.to_str().unwrap())
+            .unwrap();
         let token = new_token();
-        engine.db.create_agent("web1", &["prod".into()], &hash_token(&token)).unwrap();
+        engine
+            .db
+            .create_agent("web1", &["prod".into()], &hash_token(&token))
+            .unwrap();
 
-        let app = crate::api::router(crate::api::AppState { engine: engine.clone(), webhook_secret: None });
+        let app = crate::api::router(crate::api::AppState {
+            engine: engine.clone(),
+            webhook_secret: None,
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -410,13 +429,26 @@ jobs:
         let jobs = engine.db.jobs(run).unwrap();
         let deploy = jobs.iter().find(|j| j.name == "deploy").unwrap();
         assert_eq!(deploy.status, "success");
-        assert_eq!(jobs.iter().find(|j| j.name == "nowhere").unwrap().status, "failed");
-        let Subscription::Done(log) = engine.logs.subscribe(deploy.id) else { panic!() };
+        assert_eq!(
+            jobs.iter().find(|j| j.name == "nowhere").unwrap().status,
+            "failed"
+        );
+        let Subscription::Done(log) = engine.logs.subscribe(deploy.id) else {
+            panic!()
+        };
         let sha = engine.db.run(run).unwrap().unwrap().sha.unwrap();
-        assert!(log.contains(&format!("[web1] deploying api at {sha} from {}", agent_dir.canonicalize().unwrap().display())), "{log}");
+        assert!(
+            log.contains(&format!(
+                "[web1] deploying api at {sha} from {}",
+                agent_dir.canonicalize().unwrap().display()
+            )),
+            "{log}"
+        );
 
-        // When the agent goes away, its jobs fail instead of hanging.
-        session.abort();
+        // Revoking the agent closes its connection.
+        engine.agents.disconnect(1);
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "agent session should end after revoke");
         for _ in 0..100 {
             if engine.agents.presence().is_empty() {
                 break;

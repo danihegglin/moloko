@@ -231,11 +231,11 @@ async fn delete_agent(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
-    if s.engine.db.delete_agent(id)? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(not_found())
+    if !s.engine.db.delete_agent(id)? {
+        return Err(not_found());
     }
+    s.engine.agents.disconnect(id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Agents dial in here with `Authorization: Bearer <token>`.

@@ -13,7 +13,9 @@ make server                                # builds the dashboard and embeds it
 | `--data` / `MOLOKO_DATA` | `moloko-data` | SQLite DB, git mirrors, caches, logs, workspaces |
 | `--executors` / `MOLOKO_EXECUTORS` | CPU count | Max jobs running at once |
 | `--webhook-secret` / `MOLOKO_WEBHOOK_SECRET` | unset | Enables `POST /api/webhooks/github` (push events) |
-| `--registry-host` / `MOLOKO_REGISTRY_HOST` | `localhost:<port>` | The address jobs and agents use for the built-in registry, e.g. `moloko.tail1234.ts.net` |
+| `--registry-host` / `MOLOKO_REGISTRY_HOST` | `localhost:<port>` | The address build jobs use for the built-in registry |
+| `--wg-listen` / `MOLOKO_WG_LISTEN` | `0.0.0.0:51820` | UDP address of the built-in WireGuard endpoint for agents (`off` disables it) |
+| `--wg-endpoint` / `MOLOKO_WG_ENDPOINT` | registry host + WireGuard port | `host:port` agents dial, written into join codes, e.g. your public IP or DNS name |
 
 Requires `git`, and `docker` for jobs that set `image:`.
 
@@ -64,32 +66,35 @@ jobs:
 - `MOLOKO_IMAGE` is `<registry-host>/<project name, lowercased>`.
 - **Auth.** Each run gets its own read-write token in `MOLOKO_REGISTRY_TOKEN`. The token stops working when the run ends. Agents can also pull outside a pipeline with their agent name and token, for example `docker login <host> -u web1 -p mlk_…`. Agent tokens can pull but not push. Requests without credentials get a 401.
 - **Storage.** Content-addressed under `<data>/registry`. Layers stream to disk while being hashed, and cross-repo blob mounts and Range requests are supported. The **Images** page in the dashboard lists repositories and tags with their pull commands.
-- **HTTPS.** Docker only talks plain HTTP to `localhost`. On the build machine, the default `localhost:<port>` works on Linux. For agents on other servers, and for Docker Desktop on macOS (its daemon runs in a VM), serve moloko over HTTPS and set `--registry-host` to that name. With Tailscale, run `tailscale serve --bg 8080` and set `MOLOKO_REGISTRY_HOST=<machine>.<tailnet>.ts.net`.
+- **HTTPS.** Docker only talks plain HTTP to `localhost`. Agents connected over WireGuard pull from their own `localhost:5000`, so they need nothing extra. On the build machine, the default `localhost:<port>` works on Linux. Docker Desktop on macOS runs its daemon in a VM, so it needs moloko served over HTTPS, for example with `tailscale serve`, with `--registry-host` set to that name.
 - Not yet included: garbage collection of untagged blobs, and retention policies.
 
 ## Deploy agents
 
-Agents run on the servers you deploy to. Each one **dials out** to moloko over a WebSocket and keeps that connection open, so target servers need no inbound ports, SSH keys or firewall rules. Deploy instructions and logs travel over that connection.
+Agents run on the servers you deploy to. They connect to moloko over **built-in WireGuard**: the server listens on one UDP port, and each agent has its own key pair. Deploy instructions, logs and image pulls all travel inside the tunnel. Target servers need no inbound ports, SSH keys, certificates or VPN client. Both sides run WireGuard in userspace (boringtun plus a userspace TCP/IP stack), so they need no root and no TUN device.
 
-1. In the dashboard, go to **Agents**, then **Add agent**. Give it a name and labels such as `prod, eu`, and copy the token. It is shown only once, and only its hash is stored.
+1. In the dashboard, go to **Agents**, then **Add agent**. Give it a name and labels such as `prod, eu`, and copy the join code. The code holds the agent's private key, the server's public key, its tunnel IP and its token. It is shown only once. **New join code** rotates the key and token and disconnects the old agent.
 2. On the target server, run the same binary in agent mode:
    ```sh
-   MOLOKO_AGENT_TOKEN=mlk_… moloko agent --server wss://moloko.example.ts.net/api/agents/connect --workdir /srv/app
+   MOLOKO_JOIN=mlkjoin_… moloko agent --workdir /srv/app
    ```
-   The agent reconnects with backoff, and pings every 20s keep idle connections alive through proxies.
+   The agent sends a WireGuard keepalive every 25s to hold its NAT mapping open, and it reconnects with backoff. Use `--endpoint host:port` to override the server address in the code.
 3. Target agents from a pipeline by label. The job runs on **every** connected agent that has all the listed labels, in parallel:
    ```yaml
    deploy:
      needs: [package]
      agent: prod            # or [prod, eu]
      steps:
-       - docker compose pull && docker compose up -d
+       - echo "$MOLOKO_REGISTRY_TOKEN" | docker login "$MOLOKO_REGISTRY" -u moloko --password-stdin
+       - docker pull "$MOLOKO_IMAGE/api:$MOLOKO_SHA" && docker compose up -d
    ```
    The job fails if no matching agent is connected, or if an agent disconnects partway through. Agent jobs don't use a local executor slot.
 
-**Reaching the server.** When moloko runs on a Mac mini behind NAT, agents still need a URL that reaches it:
-- **Tailscale (recommended).** Install it on the build machine and on the targets, then use the MagicDNS name. The traffic is end-to-end WireGuard and is never exposed to the internet. `tailscale serve` adds HTTPS.
-- **Cloudflare Tunnel.** Use it when you also need a public URL, for example for GitHub webhooks. Until moloko has auth, publish only `/api/agents/connect` and `/api/webhooks/github`, never the dashboard or the rest of the API.
+**Registry on agents.** Each agent serves the build server's registry on `localhost:5000`, tunnelled through WireGuard. You can change the port with `--registry-port`. Docker allows plain HTTP to `localhost`, so pulls work with no TLS setup. In agent jobs, `MOLOKO_REGISTRY` and `MOLOKO_IMAGE` already point there.
+
+**Reachability.** Agents must be able to reach the server's UDP port. A Mac mini behind a home or office router needs that port (51820 by default) forwarded to it. Set `--wg-endpoint` to your public IP or a DNS name. The server never connects out to agents, so the agents themselves can sit behind any NAT.
+
+Without WireGuard, `moloko agent --server wss://…/api/agents/connect --token mlk_…` still connects over a WebSocket. Use that when the server sits behind something like Tailscale or Cloudflare Tunnel.
 
 ## How it stays fast
 
@@ -110,7 +115,8 @@ Agents run on the servers you deploy to. Each one **dials out** to moloko over a
 | `POST /api/runs/:id/cancel` | cancel (kills the step's whole process group) |
 | `GET /api/jobs/:id/logs` | SSE stream: `line` events, then `end` |
 | `POST /api/webhooks/github` | GitHub push webhook (HMAC-verified) |
-| `GET/POST /api/agents`, `DELETE /api/agents/:id` | list (with online status) / register `{name, labels}` → `{token}` / revoke |
+| `GET/POST /api/agents`, `DELETE /api/agents/:id` | list (with online status) / register `{name, labels}` → `{token, join}` / revoke |
+| `POST /api/agents/:id/join` | rotate the agent's WireGuard key and token, returns a new join code |
 | `GET /api/agents/connect` | agent WebSocket (`Authorization: Bearer <token>`) |
 | `GET /api/images` | registry repositories and tags |
 | `/v2/…` | OCI Distribution API (Basic auth: run token or `<agent>:<agent token>`) |

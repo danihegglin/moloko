@@ -157,6 +157,8 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release; ignore the error when the column exists.
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN wg_public TEXT", []);
         // Anything still in flight belonged to a previous process.
         let now = now_ms();
         conn.execute(
@@ -321,6 +323,30 @@ impl Db {
             params![name, serde_json::to_string(labels)?, token_hash, now_ms()],
         )?;
         Ok(c.last_insert_rowid())
+    }
+
+    pub fn set_agent_token_hash(&self, id: i64, token_hash: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET token_hash = ?2 WHERE id = ?1",
+            params![id, token_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_wg_public(&self, id: i64, public_b64: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agents SET wg_public = ?2 WHERE id = ?1",
+            params![id, public_b64],
+        )?;
+        Ok(())
+    }
+
+    /// (agent id, WireGuard public key) for every agent that has one.
+    pub fn agent_wg_keys(&self) -> Result<Vec<(i64, String)>> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT id, wg_public FROM agents WHERE wg_public IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn agents(&self) -> Result<Vec<Agent>> {

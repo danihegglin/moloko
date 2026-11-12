@@ -397,9 +397,10 @@ impl Registry {
         let uri = req.uri().clone();
         // Cross-repository mount: the blob is already here, nothing to upload.
         if let Some(d) = query_param(&uri, "mount").filter(|d| digest_hex(d).is_some())
-            && self.blob_path(digest_hex(&d).unwrap()).is_file() {
-                return self.created(name, &d);
-            }
+            && self.blob_path(digest_hex(&d).unwrap()).is_file()
+        {
+            return self.created(name, &d);
+        }
         let id = uuid();
         let file = match tokio::fs::File::create(self.root.join("uploads").join(&id)).await {
             Ok(f) => f,
@@ -846,6 +847,7 @@ mod http_tests {
         let app = crate::api::router(crate::api::AppState {
             engine: engine.clone(),
             webhook_secret: None,
+            wg: None,
         });
         let rw = basic("moloko", "runtok");
         let ro = basic("web1", &agent_token);

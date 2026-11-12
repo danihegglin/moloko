@@ -239,12 +239,18 @@ impl AgentHub {
 }
 
 /// `moloko agent`: connect to the server and run what it sends, reconnecting forever.
-pub async fn run_agent(server: String, token: String, workdir: PathBuf) -> Result<()> {
+/// `registry` overrides the registry address jobs see (the agent's local tunnel proxy).
+pub async fn run_agent(
+    server: String,
+    token: String,
+    workdir: PathBuf,
+    registry: Option<String>,
+) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
-        match agent_session(&server, &token, &workdir).await {
+        match agent_session(&server, &token, &workdir, registry.as_deref()).await {
             Ok(()) => tracing::warn!("connection closed by server"),
             Err(e) => tracing::warn!("connection failed: {e:#}"),
         }
@@ -257,7 +263,12 @@ pub async fn run_agent(server: String, token: String, workdir: PathBuf) -> Resul
     }
 }
 
-pub async fn agent_session(server: &str, token: &str, workdir: &std::path::Path) -> Result<()> {
+pub async fn agent_session(
+    server: &str,
+    token: &str,
+    workdir: &std::path::Path,
+    registry: Option<&str>,
+) -> Result<()> {
     use tokio_tungstenite::tungstenite::{Message as WsMsg, client::IntoClientRequest};
 
     let mut req = server.into_client_request().context("invalid server URL")?;
@@ -297,6 +308,10 @@ pub async fn agent_session(server: &str, token: &str, workdir: &std::path::Path)
             };
             match serde_json::from_str::<ToAgent>(&text)? {
                 ToAgent::Exec { id, script, env } => {
+                    let env = match registry {
+                        Some(r) => rewrite_registry(env, r),
+                        None => env,
+                    };
                     let cancel = session_cancel.child_token();
                     running.lock().unwrap().insert(id, cancel.clone());
                     let (tx, running, workdir) =
@@ -340,6 +355,72 @@ pub async fn agent_session(server: &str, token: &str, workdir: &std::path::Path)
     result
 }
 
+/// Point MOLOKO_REGISTRY / MOLOKO_IMAGE at the agent's local registry proxy.
+fn rewrite_registry(env: Vec<(String, String)>, local: &str) -> Vec<(String, String)> {
+    let server = env
+        .iter()
+        .find(|(k, _)| k == "MOLOKO_REGISTRY")
+        .map(|(_, v)| v.clone());
+    env.into_iter()
+        .map(|(k, v)| match (k.as_str(), &server) {
+            ("MOLOKO_REGISTRY", _) => (k, local.to_string()),
+            ("MOLOKO_IMAGE", Some(srv)) if v.starts_with(srv.as_str()) => {
+                let rest = v[srv.len()..].to_string();
+                (k, format!("{local}{rest}"))
+            }
+            _ => (k, v),
+        })
+        .collect()
+}
+
+/// `moloko agent --join`: bring up the WireGuard tunnel, expose the registry on
+/// `127.0.0.1:<registry_port>`, and run the agent channel through the tunnel.
+pub async fn run_agent_wireguard(
+    join: crate::tunnel::JoinCode,
+    endpoint: Option<String>,
+    registry_port: u16,
+    workdir: PathBuf,
+) -> Result<()> {
+    use crate::tunnel;
+    let endpoint = endpoint.unwrap_or_else(|| join.endpoint.clone());
+    let server_addr = tunnel::resolve(&endpoint).await?;
+    let net = tunnel::spawn(
+        tunnel::bind_udp("0.0.0.0:0").await?,
+        tunnel::NetstackConfig {
+            private: tunnel::key_from_b64(&join.private)?,
+            ip: join.ip,
+            peers: vec![tunnel::PeerConfig {
+                index: 1,
+                public: tunnel::key_from_b64(&join.server_public)?,
+                ip: tunnel::SERVER_IP,
+                endpoint: Some(server_addr),
+                // Keeps the NAT mapping open so the server can reach us.
+                keepalive: Some(25),
+            }],
+            accept: None,
+        },
+    );
+    let control = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let control_addr = control.local_addr()?;
+    net.forward_local(control, (tunnel::SERVER_IP, tunnel::TUNNEL_PORT));
+    let registry = tokio::net::TcpListener::bind(("127.0.0.1", registry_port))
+        .await
+        .with_context(|| format!("bind registry proxy on 127.0.0.1:{registry_port}"))?;
+    let registry_addr = format!("localhost:{}", registry.local_addr()?.port());
+    net.forward_local(registry, (tunnel::SERVER_IP, tunnel::TUNNEL_PORT));
+    tracing::info!(
+        "WireGuard tunnel to {endpoint} as {}; registry at {registry_addr}",
+        join.ip
+    );
+    run_agent(
+        format!("ws://{control_addr}/api/agents/connect"),
+        join.token,
+        workdir,
+        Some(registry_addr),
+    )
+    .await
+}
+
 fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
@@ -365,6 +446,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("run did not finish");
+    }
+
+    #[test]
+    fn registry_env_points_at_local_proxy() {
+        let env = vec![
+            ("MOLOKO_REGISTRY".to_string(), "build.lan:8080".to_string()),
+            ("MOLOKO_IMAGE".to_string(), "build.lan:8080/demo".to_string()),
+            ("OTHER".to_string(), "build.lan:8080".to_string()),
+        ];
+        let out = rewrite_registry(env, "localhost:5000");
+        assert_eq!(out[0].1, "localhost:5000");
+        assert_eq!(out[1].1, "localhost:5000/demo");
+        assert_eq!(out[2].1, "build.lan:8080");
     }
 
     #[tokio::test]
@@ -400,6 +494,7 @@ jobs:
         let app = crate::api::router(crate::api::AppState {
             engine: engine.clone(),
             webhook_secret: None,
+            wg: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -407,13 +502,17 @@ jobs:
 
         // A wrong token is rejected.
         let url = format!("ws://{addr}/api/agents/connect");
-        assert!(agent_session(&url, "mlk_wrong", dir.path()).await.is_err());
+        assert!(
+            agent_session(&url, "mlk_wrong", dir.path(), None)
+                .await
+                .is_err()
+        );
 
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let session = tokio::spawn({
             let (url, agent_dir) = (url.clone(), agent_dir.clone());
-            async move { agent_session(&url, &token, &agent_dir).await }
+            async move { agent_session(&url, &token, &agent_dir, None).await }
         });
         // Wait until the agent is registered and its hello has arrived.
         for _ in 0..100 {

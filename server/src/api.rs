@@ -24,6 +24,28 @@ use tokio::sync::broadcast::error::RecvError;
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub webhook_secret: Option<String>,
+    pub wg: Option<WgServer>,
+}
+
+/// The server's built-in WireGuard endpoint.
+#[derive(Clone)]
+pub struct WgServer {
+    pub netstack: crate::tunnel::Netstack,
+    pub public: [u8; 32],
+    /// host:port agents dial, written into join codes.
+    pub endpoint: String,
+}
+
+impl WgServer {
+    pub fn peer(agent_id: i64, public: [u8; 32]) -> crate::tunnel::PeerConfig {
+        crate::tunnel::PeerConfig {
+            index: agent_id as u32,
+            public,
+            ip: crate::tunnel::agent_ip(agent_id),
+            endpoint: None,
+            keepalive: None,
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -37,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/webhooks/github", post(github_webhook))
         .route("/api/agents", get(list_agents).post(create_agent))
         .route("/api/agents/{id}", delete(delete_agent))
+        .route("/api/agents/{id}/join", post(rotate_join))
         .route("/api/agents/connect", get(agent_connect))
         .route("/api/images", get(list_images))
         .route("/v2", any(registry))
@@ -226,18 +249,83 @@ async fn create_agent(
         .db
         .create_agent(name, &labels, &crate::agents::hash_token(&token))
         .map_err(|e| bad_request(format!("{e:#}")))?;
+    // With WireGuard on, the agent gets a key pair and a join code that carries everything.
+    let join = match &s.wg {
+        Some(wg) => Some(issue_join(&s, wg, id, &token)?),
+        None => None,
+    };
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "id": id, "token": token })),
+        Json(json!({ "id": id, "token": token, "join": join })),
     ))
+}
+
+/// Give agent `id` a fresh WireGuard key pair and return its join code.
+fn issue_join(s: &AppState, wg: &WgServer, id: i64, token: &str) -> anyhow::Result<String> {
+    let private = crate::tunnel::new_private_key();
+    let public = crate::tunnel::public_key(&private);
+    if let Some((_, old)) = s
+        .engine
+        .db
+        .agent_wg_keys()?
+        .into_iter()
+        .find(|(a, _)| *a == id)
+        && let Ok(k) = crate::tunnel::key_from_b64(&old)
+    {
+        wg.netstack.remove_peer(k);
+    }
+    s.engine
+        .db
+        .set_agent_wg_public(id, &crate::tunnel::b64(&public))?;
+    wg.netstack.add_peer(WgServer::peer(id, public));
+    Ok(crate::tunnel::JoinCode {
+        endpoint: wg.endpoint.clone(),
+        server_public: crate::tunnel::b64(&wg.public),
+        private: crate::tunnel::b64(&private),
+        ip: crate::tunnel::agent_ip(id),
+        token: token.to_string(),
+    }
+    .encode())
+}
+
+/// Issue a new join code (new WireGuard key and token) for an existing agent.
+/// The old code stops working and the agent's current connection is closed.
+async fn rotate_join(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let Some(wg) = &s.wg else {
+        return Err(bad_request("WireGuard is disabled on this server"));
+    };
+    if !s.engine.db.agents()?.iter().any(|a| a.id == id) {
+        return Err(not_found());
+    }
+    let token = crate::agents::new_token();
+    s.engine
+        .db
+        .set_agent_token_hash(id, &crate::agents::hash_token(&token))?;
+    let join = issue_join(&s, wg, id, &token)?;
+    s.engine.agents.disconnect(id);
+    Ok(Json(json!({ "id": id, "token": token, "join": join })))
 }
 
 async fn delete_agent(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<impl IntoResponse> {
+    let wg_key = s
+        .engine
+        .db
+        .agent_wg_keys()?
+        .into_iter()
+        .find(|(a, _)| *a == id);
     if !s.engine.db.delete_agent(id)? {
         return Err(not_found());
+    }
+    if let (Some(wg), Some((_, key))) = (&s.wg, wg_key)
+        && let Ok(k) = crate::tunnel::key_from_b64(&key)
+    {
+        wg.netstack.remove_peer(k);
     }
     s.engine.agents.disconnect(id);
     Ok(StatusCode::NO_CONTENT)

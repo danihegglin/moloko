@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 async-stream = "0.3.6"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
+boringtun = "0.7.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = "0.3.34"
 hex = "0.4.3"
@@ -21,6 +22,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml = "0.9.34"
 sha2 = "0.11.1"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+socket2 = "0.6.5"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 tokio-util = "0.7.20"

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, ago, type AgentRow, duration, isActive, shortRef, type Job, type Project, type Status } from './api'
+import { api, ago, type AgentRow, type AgentSecret, duration, isActive, shortRef, type Job, type Project, type Status } from './api'
 
 // Hash routes: #/ (runs) and #/runs/:id
 function useRoute() {
@@ -343,7 +343,7 @@ function LogView({ job }: { job: Job }) {
 function AgentsPage() {
   const [version, setVersion] = useState(0)
   const agents = usePoll(api.agents, 3000, [version])
-  const [created, setCreated] = useState<{ name: string; token: string } | null>(null)
+  const [created, setCreated] = useState<{ name: string; secret: AgentSecret; rotated?: boolean } | null>(null)
   const now = useNow(5000)
   const refresh = () => setVersion((v) => v + 1)
 
@@ -351,8 +351,8 @@ function AgentsPage() {
     <>
       <section className="toolbar">
         <AddAgent
-          onCreated={(name, token) => {
-            setCreated({ name, token })
+          onCreated={(name, secret) => {
+            setCreated({ name, secret })
             refresh()
           }}
         />
@@ -371,7 +371,16 @@ function AgentsPage() {
       <table className="runs">
         <tbody>
           {agents.data?.map((row) => (
-            <AgentLine key={row.agent.id} row={row} now={now} onDeleted={refresh} />
+            <AgentLine
+              key={row.agent.id}
+              row={row}
+              now={now}
+              onDeleted={refresh}
+              onRotated={(secret) => {
+                setCreated({ name: row.agent.name, secret, rotated: true })
+                refresh()
+              }}
+            />
           ))}
         </tbody>
       </table>
@@ -379,8 +388,26 @@ function AgentsPage() {
   )
 }
 
-function AgentLine({ row, now, onDeleted }: { row: AgentRow; now: number; onDeleted: () => void }) {
+function AgentLine({
+  row,
+  now,
+  onDeleted,
+  onRotated,
+}: {
+  row: AgentRow
+  now: number
+  onDeleted: () => void
+  onRotated: (s: AgentSecret) => void
+}) {
   const { agent, online, presence } = row
+  const rotate = async () => {
+    if (!confirm(`Issue a new join code for ${agent.name}? The current one stops working.`)) return
+    try {
+      onRotated(await api.rotateJoin(agent.id))
+    } catch (err) {
+      alert((err as Error).message)
+    }
+  }
   const remove = async () => {
     if (!confirm(`Delete agent ${agent.name}? Its token stops working immediately.`)) return
     await api.deleteAgent(agent.id).catch(() => {})
@@ -404,6 +431,9 @@ function AgentLine({ row, now, onDeleted }: { row: AgentRow; now: number; onDele
         {online ? 'connected' : agent.last_seen ? `seen ${ago(agent.last_seen, now)}` : 'never connected'}
       </td>
       <td className="right">
+        <button className="secondary small" onClick={rotate}>
+          New join code
+        </button>
         <button className="danger small" onClick={remove}>
           Delete
         </button>
@@ -412,7 +442,7 @@ function AgentLine({ row, now, onDeleted }: { row: AgentRow; now: number; onDele
   )
 }
 
-function AddAgent({ onCreated }: { onCreated: (name: string, token: string) => void }) {
+function AddAgent({ onCreated }: { onCreated: (name: string, secret: AgentSecret) => void }) {
   const [name, setName] = useState('')
   const [labels, setLabels] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -420,8 +450,7 @@ function AddAgent({ onCreated }: { onCreated: (name: string, token: string) => v
     e.preventDefault()
     try {
       const list = labels.split(',').map((l) => l.trim()).filter(Boolean)
-      const { token } = await api.createAgent(name, list)
-      onCreated(name, token)
+      onCreated(name, await api.createAgent(name, list))
       setName('')
       setLabels('')
       setError(null)
@@ -439,14 +468,34 @@ function AddAgent({ onCreated }: { onCreated: (name: string, token: string) => v
   )
 }
 
-function AgentToken({ name, token, onClose }: { name: string; token: string; onClose: () => void }) {
+function AgentToken({
+  name,
+  secret,
+  rotated,
+  onClose,
+}: {
+  name: string
+  secret: AgentSecret
+  rotated?: boolean
+  onClose: () => void
+}) {
   const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/agents/connect`
+  const command = secret.join
+    ? `MOLOKO_JOIN=${secret.join} \\\n  moloko agent`
+    : `MOLOKO_AGENT_TOKEN=${secret.token} \\\n  moloko agent --server ${wsUrl}`
   return (
     <div className="token-box">
       <p>
-        <strong>{name}</strong> created. Copy the token now, because it won't be shown again. Run this on the target server:
+        <strong>{name}</strong> {rotated ? 'has a new join code' : 'created'}. Copy it now, because it won't be shown again.
+        Run this on the target server:
       </p>
-      <pre>{`MOLOKO_AGENT_TOKEN=${token} \\\n  moloko agent --server ${wsUrl}`}</pre>
+      <pre>{command}</pre>
+      {secret.join && (
+        <p className="muted">
+          The agent connects over built-in WireGuard and needs no inbound ports. Deploy steps can pull images from{' '}
+          <code>localhost:5000</code>.
+        </p>
+      )}
       <button className="secondary small" onClick={onClose}>
         Done
       </button>

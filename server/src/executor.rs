@@ -42,8 +42,9 @@ impl Executor {
             "-v",
         ])
         .arg(format!("{}:/workspace", workspace.display()));
+        // `-e NAME` takes the value from docker's own environment, keeping it out of argv.
         for (k, v) in env {
-            cmd.arg("-e").arg(format!("{k}={v}"));
+            cmd.env(k, v).arg("-e").arg(k);
         }
         cmd.args([image, "-c", "trap 'exit 0' TERM; sleep infinity & wait"]);
         let out = cmd.output().await.context("failed to run docker")?;
@@ -66,7 +67,7 @@ impl Executor {
         log: &(dyn Fn(&str) + Sync),
         cancel: &CancellationToken,
     ) -> Result<StepResult> {
-        let mut cmd = match self {
+        let cmd = match self {
             Executor::Host => {
                 let mut c = Command::new("sh");
                 c.args(["-e", "-c", script])
@@ -80,30 +81,7 @@ impl Executor {
                 c
             }
         };
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true);
-        let mut child = cmd.spawn().context("failed to spawn step")?;
-        let pid = child.id();
-        let out = pump(child.stdout.take().unwrap(), log);
-        let err = pump(child.stderr.take().unwrap(), log);
-        let pumps = async { tokio::join!(out, err) };
-
-        tokio::select! {
-            (status, _) = async { tokio::join!(child.wait(), pumps) } => {
-                Ok(StepResult::Exited(status?.code().unwrap_or(-1)))
-            }
-            _ = cancel.cancelled() => {
-                if let Some(pid) = pid {
-                    // Kill the whole process group so grandchildren (e.g. a JVM) die too.
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                }
-                let _ = child.wait().await;
-                Ok(StepResult::Cancelled)
-            }
-        }
+        stream(cmd, log, cancel).await
     }
 
     pub async fn shutdown(&self) {
@@ -112,6 +90,38 @@ impl Executor {
                 .args(["rm", "-f", container])
                 .output()
                 .await;
+        }
+    }
+}
+
+/// Run `cmd`, sending each stdout/stderr line to `log`. On cancellation the whole process group is killed.
+pub async fn stream(
+    mut cmd: Command,
+    log: &(dyn Fn(&str) + Sync),
+    cancel: &CancellationToken,
+) -> Result<StepResult> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().context("failed to spawn step")?;
+    let pid = child.id();
+    let out = pump(child.stdout.take().unwrap(), log);
+    let err = pump(child.stderr.take().unwrap(), log);
+    let pumps = async { tokio::join!(out, err) };
+
+    tokio::select! {
+        (status, _) = async { tokio::join!(child.wait(), pumps) } => {
+            Ok(StepResult::Exited(status?.code().unwrap_or(-1)))
+        }
+        _ = cancel.cancelled() => {
+            if let Some(pid) = pid {
+                // Kill the whole process group so grandchildren (e.g. a JVM) die too.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
+            let _ = child.wait().await;
+            Ok(StepResult::Cancelled)
         }
     }
 }

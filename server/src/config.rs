@@ -30,6 +30,9 @@ pub struct JobSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub cache: Vec<CacheSpec>,
+    /// Vault secrets to expose to the steps as environment variables.
+    #[serde(default)]
+    pub secrets: Vec<String>,
     pub steps: Vec<Step>,
 }
 

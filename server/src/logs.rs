@@ -11,10 +11,46 @@ pub struct JobLog {
     file: Mutex<BufWriter<File>>,
     path: PathBuf,
     tx: broadcast::Sender<String>,
+    /// Secret values replaced by `***` in every line.
+    masks: Mutex<Vec<String>>,
+    /// The latest `▶` line: the step the job is on.
+    step: Mutex<Option<String>>,
 }
 
 impl JobLog {
+    /// Hide these values (and each line of multi-line values) in everything logged from now on.
+    pub fn mask<'a>(&self, values: impl IntoIterator<Item = &'a str>) {
+        let mut m = self.masks.lock().unwrap();
+        for v in values {
+            for part in std::iter::once(v).chain(v.lines()) {
+                let part = part.trim();
+                if part.len() >= 3 && !m.iter().any(|x| x == part) {
+                    m.push(part.to_string());
+                }
+            }
+        }
+        // Longest first, so a value isn't half-replaced by a shorter one it contains.
+        m.sort_by_key(|x| std::cmp::Reverse(x.len()));
+    }
+
     pub fn line(&self, line: &str) {
+        let masked;
+        let line = {
+            let m = self.masks.lock().unwrap();
+            if m.is_empty() {
+                line
+            } else {
+                let mut s = line.to_string();
+                for v in m.iter() {
+                    s = s.replace(v.as_str(), "***");
+                }
+                masked = s;
+                &masked
+            }
+        };
+        if let Some(step) = line.strip_prefix("▶ ") {
+            *self.step.lock().unwrap() = Some(step.to_string());
+        }
         // Hold the file lock while broadcasting so subscribe() never misses or duplicates a line.
         let mut f = self.file.lock().unwrap();
         let _ = writeln!(f, "{line}");
@@ -55,6 +91,8 @@ impl LogHub {
             file: Mutex::new(BufWriter::new(file)),
             path,
             tx,
+            masks: Mutex::default(),
+            step: Mutex::default(),
         });
         self.live.lock().unwrap().insert(job_id, log.clone());
         Ok(log)
@@ -65,6 +103,12 @@ impl LogHub {
         if let Some(log) = self.live.lock().unwrap().remove(&job_id) {
             let _ = log.file.lock().unwrap().flush();
         }
+    }
+
+    /// The step a running job is on, as last announced in its log.
+    pub fn step(&self, job_id: i64) -> Option<String> {
+        let live = self.live.lock().unwrap();
+        live.get(&job_id)?.step.lock().unwrap().clone()
     }
 
     pub fn subscribe(&self, job_id: i64) -> Subscription {
@@ -99,14 +143,17 @@ mod tests {
             panic!("expected live")
         };
         assert_eq!(existing, "one\n");
-        log.line("two");
-        assert_eq!(rx.recv().await.unwrap(), "two");
+        assert_eq!(hub.step(1), None);
+        log.line("▶ two");
+        assert_eq!(rx.recv().await.unwrap(), "▶ two");
+        assert_eq!(hub.step(1).as_deref(), Some("two"));
         drop(log);
         hub.close(1);
         assert!(rx.recv().await.is_err());
         let Subscription::Done(all) = hub.subscribe(1) else {
             panic!("expected done")
         };
-        assert_eq!(all, "one\ntwo\n");
+        assert_eq!(hub.step(1), None);
+        assert_eq!(all, "one\n▶ two\n");
     }
 }

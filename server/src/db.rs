@@ -1,6 +1,6 @@
 //! SQLite persistence for projects, runs and jobs.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::path::Path;
@@ -39,19 +39,34 @@ impl Status {
 pub struct Project {
     pub id: i64,
     pub name: String,
-    pub repo_url: String,
+    pub created_at: i64,
+    pub repos: Vec<Repo>,
+}
+
+/// A git repository inside a project. Each repo has its own mirror, pipeline and runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct Repo {
+    pub id: i64,
+    pub project_id: i64,
+    pub project_name: String,
+    pub name: String,
+    pub url: String,
     pub created_at: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Run {
     pub id: i64,
+    pub repo_id: i64,
+    pub repo_name: String,
     pub project_id: i64,
     pub project_name: String,
     pub git_ref: String,
     pub sha: Option<String>,
     pub status: String,
     pub trigger: String,
+    /// `.moloko.yml` or the GitHub workflow's name.
+    pub workflow: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
     pub started_at: Option<i64>,
@@ -68,6 +83,17 @@ pub struct Job {
     pub exit_code: Option<i32>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// The step a running job is on. Not stored: the API fills it in from the live log.
+    pub step: Option<String>,
+}
+
+/// (name, nonce, sealed value)
+pub type SealedSecret = (String, Vec<u8>, Vec<u8>);
+
+#[derive(Debug, Serialize)]
+pub struct SecretInfo {
+    pub name: String,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,20 +116,29 @@ fn map_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
     })
 }
 
-pub struct Db(Mutex<Connection>);
+pub struct Db(
+    Mutex<Connection>,
+    /// Jobs that were running when the previous process stopped.
+    pub Vec<i64>,
+);
 
-const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+const TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    repo_url TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS repos (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (project_id, name)
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
-    project_id INTEGER NOT NULL REFERENCES projects(id),
+    repo_id INTEGER NOT NULL REFERENCES repos(id),
     git_ref TEXT NOT NULL,
     sha TEXT,
     status TEXT NOT NULL,
@@ -113,7 +148,7 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at INTEGER,
     finished_at INTEGER
 );
-CREATE INDEX IF NOT EXISTS runs_project ON runs(project_id, id DESC);
+CREATE INDEX IF NOT EXISTS runs_repo ON runs(repo_id, id DESC);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -125,6 +160,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id);
+CREATE TABLE IF NOT EXISTS secrets (
+    scope TEXT NOT NULL,
+    name TEXT NOT NULL,
+    nonce BLOB NOT NULL,
+    value BLOB NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (scope, name)
+);
 CREATE TABLE IF NOT EXISTS agents (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -135,31 +178,89 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 "#;
 
-const RUN_COLS: &str = "r.id, r.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at";
+/// Before projects held repos, each project had one `repo_url` and runs pointed at the project.
+/// Turn every old project into a project with one repo of the same id, so git mirrors
+/// (`git/<id>.git`) and run history stay valid.
+const MIGRATE_REPOS: &str = r#"
+ALTER TABLE projects RENAME TO projects_old;
+ALTER TABLE runs RENAME TO runs_old;
+"#;
+const MIGRATE_REPOS_COPY: &str = r#"
+INSERT INTO projects (id, name, created_at) SELECT id, name, created_at FROM projects_old;
+INSERT INTO repos (id, project_id, name, url, created_at)
+    SELECT id, id, name, repo_url, created_at FROM projects_old;
+INSERT INTO runs (id, repo_id, git_ref, sha, status, trigger, error, created_at, started_at, finished_at)
+    SELECT id, project_id, git_ref, sha, status, trigger, error, created_at, started_at, finished_at FROM runs_old;
+DROP TABLE runs_old;
+DROP TABLE projects_old;
+"#;
+
+const RUN_COLS: &str = "r.id, r.repo_id, g.name, g.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at, r.workflow";
+const RUN_FROM: &str =
+    "runs r JOIN repos g ON g.id = r.repo_id JOIN projects p ON p.id = g.project_id";
 
 fn map_run(r: &rusqlite::Row) -> rusqlite::Result<Run> {
     Ok(Run {
         id: r.get(0)?,
-        project_id: r.get(1)?,
-        project_name: r.get(2)?,
-        git_ref: r.get(3)?,
-        sha: r.get(4)?,
-        status: r.get(5)?,
-        trigger: r.get(6)?,
-        error: r.get(7)?,
-        created_at: r.get(8)?,
-        started_at: r.get(9)?,
-        finished_at: r.get(10)?,
+        repo_id: r.get(1)?,
+        repo_name: r.get(2)?,
+        project_id: r.get(3)?,
+        project_name: r.get(4)?,
+        git_ref: r.get(5)?,
+        sha: r.get(6)?,
+        status: r.get(7)?,
+        trigger: r.get(8)?,
+        error: r.get(9)?,
+        created_at: r.get(10)?,
+        started_at: r.get(11)?,
+        finished_at: r.get(12)?,
+        workflow: r.get(13)?,
     })
 }
+
+const REPO_COLS: &str = "g.id, g.project_id, p.name, g.name, g.url, g.created_at";
+
+fn map_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
+    Ok(Repo {
+        id: r.get(0)?,
+        project_id: r.get(1)?,
+        project_name: r.get(2)?,
+        name: r.get(3)?,
+        url: r.get(4)?,
+        created_at: r.get(5)?,
+    })
+}
+
+const ACTIVE_RUN_OF_REPOS: &str =
+    "SELECT 1 FROM runs WHERE status IN ('queued', 'running') AND repo_id IN";
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        let has_repo_url: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name = 'repo_url'")?
+            .exists([])?;
+        if has_repo_url {
+            // foreign_keys can't change inside a transaction; legacy_alter_table stops the
+            // renames from rewriting the `jobs -> runs` reference to point at `runs_old`.
+            conn.execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON; BEGIN;
+                 {MIGRATE_REPOS} {TABLES} {MIGRATE_REPOS_COPY}
+                 COMMIT; PRAGMA legacy_alter_table = OFF;"
+            ))?;
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(TABLES)?;
+        // Added after the first release; ignore the error when the column exists.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN workflow TEXT", []);
         // Added after the first release; ignore the error when the column exists.
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN wg_public TEXT", []);
         // Anything still in flight belonged to a previous process.
+        let interrupted = conn
+            .prepare("SELECT id FROM jobs WHERE status = 'running'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
         let now = now_ms();
         conn.execute(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?1 WHERE status IN ('queued', 'running')",
@@ -169,61 +270,177 @@ impl Db {
             "UPDATE runs SET status = 'cancelled', finished_at = ?1, error = 'server restarted' WHERE status IN ('queued', 'running')",
             [now],
         )?;
-        Ok(Db(Mutex::new(conn)))
+        Ok(Db(Mutex::new(conn), interrupted))
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap()
     }
 
-    pub fn create_project(&self, name: &str, repo_url: &str) -> Result<i64> {
+    pub fn create_project(&self, name: &str) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO projects (name, repo_url, created_at) VALUES (?1, ?2, ?3)",
-            params![name, repo_url, now_ms()],
+            "INSERT INTO projects (name, created_at) VALUES (?1, ?2)",
+            params![name, now_ms()],
         )?;
         Ok(c.last_insert_rowid())
     }
 
+    pub fn rename_project(&self, id: i64, name: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE projects SET name = ?2 WHERE id = ?1",
+            params![id, name],
+        )? > 0)
+    }
+
+    /// Delete a project with its repos, runs and jobs. Returns the deleted repo ids,
+    /// `None` if the project doesn't exist. Fails while any of its runs is active.
+    pub fn delete_project(&self, id: i64) -> Result<Option<Vec<i64>>> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        if !tx
+            .prepare("SELECT 1 FROM projects WHERE id = ?1")?
+            .exists([id])?
+        {
+            return Ok(None);
+        }
+        let repos: Vec<i64> = tx
+            .prepare("SELECT id FROM repos WHERE project_id = ?1")?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let sub = "(SELECT id FROM repos WHERE project_id = ?1)";
+        if tx
+            .prepare(&format!("{ACTIVE_RUN_OF_REPOS} {sub}"))?
+            .exists([id])?
+        {
+            bail!("a run of this project is still active; cancel it first");
+        }
+        tx.execute(
+            &format!("DELETE FROM jobs WHERE run_id IN (SELECT id FROM runs WHERE repo_id IN {sub})"),
+            [id],
+        )?;
+        tx.execute(&format!("DELETE FROM runs WHERE repo_id IN {sub}"), [id])?;
+        tx.execute(
+            "DELETE FROM secrets WHERE scope = 'p:' || ?1 OR scope IN (SELECT 'r:' || id FROM repos WHERE project_id = ?1)",
+            [id],
+        )?;
+        tx.execute("DELETE FROM repos WHERE project_id = ?1", [id])?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(Some(repos))
+    }
+
+    /// All projects with their repos.
     pub fn projects(&self) -> Result<Vec<Project>> {
+        let mut repos = self.repos()?;
         let c = self.conn();
-        let mut st =
-            c.prepare("SELECT id, name, repo_url, created_at FROM projects ORDER BY name")?;
+        let mut st = c.prepare("SELECT id, name, created_at FROM projects ORDER BY name")?;
         let rows = st.query_map([], |r| {
             Ok(Project {
                 id: r.get(0)?,
                 name: r.get(1)?,
-                repo_url: r.get(2)?,
-                created_at: r.get(3)?,
+                created_at: r.get(2)?,
+                repos: Vec::new(),
             })
         })?;
+        let mut projects: Vec<Project> = rows.collect::<rusqlite::Result<_>>()?;
+        for p in &mut projects {
+            p.repos = repos.extract_if(.., |r| r.project_id == p.id).collect();
+        }
+        Ok(projects)
+    }
+
+    pub fn project_exists(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn()
+            .prepare("SELECT 1 FROM projects WHERE id = ?1")?
+            .exists([id])?)
+    }
+
+    pub fn create_repo(&self, project_id: i64, name: &str, url: &str) -> Result<i64> {
+        let c = self.conn();
+        c.execute(
+            "INSERT INTO repos (project_id, name, url, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, name, url, now_ms()],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn repos(&self) -> Result<Vec<Repo>> {
+        let c = self.conn();
+        let mut st = c.prepare(&format!(
+            "SELECT {REPO_COLS} FROM repos g JOIN projects p ON p.id = g.project_id ORDER BY g.name"
+        ))?;
+        let rows = st.query_map([], map_repo)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn project(&self, id: i64) -> Result<Option<Project>> {
+    pub fn repo(&self, id: i64) -> Result<Option<Repo>> {
         let c = self.conn();
         Ok(c.query_row(
-            "SELECT id, name, repo_url, created_at FROM projects WHERE id = ?1",
+            &format!(
+                "SELECT {REPO_COLS} FROM repos g JOIN projects p ON p.id = g.project_id WHERE g.id = ?1"
+            ),
             [id],
-            |r| {
-                Ok(Project {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    repo_url: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
-            },
+            map_repo,
         )
         .optional()?)
     }
 
-    pub fn create_run(&self, project_id: i64, git_ref: &str, trigger: &str) -> Result<i64> {
+    /// Change a repo's name and/or URL. Changing the URL fails while a run of the repo is active.
+    pub fn update_repo(&self, id: i64, name: Option<&str>, url: Option<&str>) -> Result<bool> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        if url.is_some() && tx.prepare(&format!("{ACTIVE_RUN_OF_REPOS} (?1)"))?.exists([id])? {
+            bail!("a run of this repo is still active; cancel it first");
+        }
+        let n = tx.execute(
+            "UPDATE repos SET name = COALESCE(?2, name), url = COALESCE(?3, url) WHERE id = ?1",
+            params![id, name, url],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Delete a repo with its runs and jobs. Fails while one of its runs is active.
+    pub fn delete_repo(&self, id: i64) -> Result<bool> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        if tx.prepare(&format!("{ACTIVE_RUN_OF_REPOS} (?1)"))?.exists([id])? {
+            bail!("a run of this repo is still active; cancel it first");
+        }
+        tx.execute(
+            "DELETE FROM jobs WHERE run_id IN (SELECT id FROM runs WHERE repo_id = ?1)",
+            [id],
+        )?;
+        tx.execute("DELETE FROM runs WHERE repo_id = ?1", [id])?;
+        tx.execute("DELETE FROM secrets WHERE scope = 'r:' || ?1", [id])?;
+        let n = tx.execute("DELETE FROM repos WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn create_run(&self, repo_id: i64, git_ref: &str, trigger: &str) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO runs (project_id, git_ref, status, trigger, created_at) VALUES (?1, ?2, 'queued', ?3, ?4)",
-            params![project_id, git_ref, trigger, now_ms()],
+            "INSERT INTO runs (repo_id, git_ref, status, trigger, created_at) VALUES (?1, ?2, 'queued', ?3, ?4)",
+            params![repo_id, git_ref, trigger, now_ms()],
         )?;
         Ok(c.last_insert_rowid())
+    }
+
+    pub fn set_run_workflow(&self, id: i64, workflow: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE runs SET workflow = ?2 WHERE id = ?1",
+            params![id, workflow],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_job(&self, id: i64, name: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE jobs SET name = ?2 WHERE id = ?1", params![id, name])?;
+        Ok(())
     }
 
     pub fn start_run(&self, id: i64, sha: &str) -> Result<()> {
@@ -242,22 +459,26 @@ impl Db {
         Ok(())
     }
 
-    pub fn runs(&self, project_id: Option<i64>, limit: i64) -> Result<Vec<Run>> {
+    pub fn runs(
+        &self,
+        project_id: Option<i64>,
+        repo_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<Run>> {
         let c = self.conn();
         let sql = format!(
-            "SELECT {RUN_COLS} FROM runs r JOIN projects p ON p.id = r.project_id
-             WHERE (?1 IS NULL OR r.project_id = ?1) ORDER BY r.id DESC LIMIT ?2"
+            "SELECT {RUN_COLS} FROM {RUN_FROM}
+             WHERE (?1 IS NULL OR g.project_id = ?1) AND (?2 IS NULL OR r.repo_id = ?2)
+             ORDER BY r.id DESC LIMIT ?3"
         );
         let mut st = c.prepare(&sql)?;
-        let rows = st.query_map(params![project_id, limit], map_run)?;
+        let rows = st.query_map(params![project_id, repo_id, limit], map_run)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn run(&self, id: i64) -> Result<Option<Run>> {
         let c = self.conn();
-        let sql = format!(
-            "SELECT {RUN_COLS} FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?1"
-        );
+        let sql = format!("SELECT {RUN_COLS} FROM {RUN_FROM} WHERE r.id = ?1");
         Ok(c.query_row(&sql, [id], map_run).optional()?)
     }
 
@@ -302,6 +523,7 @@ impl Db {
                 exit_code: r.get(5)?,
                 started_at: r.get(6)?,
                 finished_at: r.get(7)?,
+                step: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -314,6 +536,38 @@ impl Db {
                 .optional()?
                 .is_some(),
         )
+    }
+
+    pub fn put_secret(&self, scope: &str, name: &str, nonce: &[u8], value: &[u8]) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO secrets (scope, name, nonce, value, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (scope, name) DO UPDATE SET nonce = ?3, value = ?4, updated_at = ?5",
+            params![scope, name, nonce, value, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Names and update times only; values never leave the database encrypted or not.
+    pub fn secret_names(&self, scope: &str) -> Result<Vec<SecretInfo>> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT name, updated_at FROM secrets WHERE scope = ?1 ORDER BY name")?;
+        let rows = st.query_map([scope], |r| Ok(SecretInfo { name: r.get(0)?, updated_at: r.get(1)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_secret(&self, scope: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM secrets WHERE scope = ?1 AND name = ?2", params![scope, name])?
+            > 0)
+    }
+
+    /// Every secret in `scope`, still encrypted.
+    pub fn sealed_secrets(&self, scope: &str) -> Result<Vec<SealedSecret>> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT name, nonce, value FROM secrets WHERE scope = ?1")?;
+        let rows = st.query_map([scope], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn create_agent(&self, name: &str, labels: &[String], token_hash: &str) -> Result<i64> {
@@ -380,5 +634,72 @@ impl Db {
             .conn()
             .execute("DELETE FROM agents WHERE id = ?1", [id])?
             > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_projects_with_repo_url_to_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("moloko.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, repo_url TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE TABLE runs (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), git_ref TEXT NOT NULL, sha TEXT, status TEXT NOT NULL, trigger TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER);
+                 CREATE INDEX runs_project ON runs(project_id, id DESC);
+                 CREATE TABLE jobs (id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id), name TEXT NOT NULL, needs TEXT NOT NULL, status TEXT NOT NULL, exit_code INTEGER, started_at INTEGER, finished_at INTEGER);
+                 INSERT INTO projects VALUES (7, 'shop', 'https://github.com/acme/shop', 1);
+                 INSERT INTO runs VALUES (3, 7, 'main', 'abc', 'success', 'manual', NULL, 2, 2, 3);
+                 INSERT INTO jobs VALUES (5, 3, 'build', '[]', 'success', 0, 2, 3);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let projects = db.projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "shop");
+        let repo = &projects[0].repos[0];
+        assert_eq!((repo.id, repo.name.as_str()), (7, "shop"));
+        assert_eq!(repo.url, "https://github.com/acme/shop");
+        let run = db.run(3).unwrap().unwrap();
+        assert_eq!((run.repo_id, run.project_name.as_str()), (7, "shop"));
+        assert_eq!(db.jobs(3).unwrap()[0].name, "build");
+        // jobs still reference the new runs table, so deleting cascades cleanly.
+        assert_eq!(db.delete_project(7).unwrap(), Some(vec![7]));
+        assert!(!db.job_exists(5).unwrap());
+        // Opening again is a no-op.
+        drop(db);
+        Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn update_and_delete_refuse_active_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("moloko.db")).unwrap();
+        let p = db.create_project("shop").unwrap();
+        let api = db.create_repo(p, "api", "https://x/api").unwrap();
+        let web = db.create_repo(p, "web", "https://x/web").unwrap();
+        assert!(db.create_repo(p, "api", "https://x/other").is_err());
+        let run = db.create_run(api, "main", "manual").unwrap();
+        db.create_job(run, "build", &[]).unwrap();
+
+        assert!(db.update_repo(api, None, Some("git@x:api.git")).is_err());
+        assert!(db.update_repo(api, Some("backend"), None).unwrap());
+        assert!(db.delete_repo(api).is_err());
+        assert!(db.delete_project(p).is_err());
+
+        db.finish_run(run, Status::Success, None).unwrap();
+        assert!(db.update_repo(api, None, Some("git@x:api.git")).unwrap());
+        assert_eq!(db.repo(api).unwrap().unwrap().url, "git@x:api.git");
+        assert_eq!(db.repo(api).unwrap().unwrap().name, "backend");
+        assert!(db.delete_repo(web).unwrap());
+        assert!(!db.delete_repo(web).unwrap());
+        assert_eq!(db.delete_project(p).unwrap(), Some(vec![api]));
+        assert!(db.runs(None, None, 10).unwrap().is_empty());
+        assert_eq!(db.delete_project(p).unwrap(), None);
     }
 }

@@ -5,9 +5,11 @@ mod config;
 mod db;
 mod engine;
 mod executor;
+mod gha;
 mod git;
 mod logs;
 mod registry;
+mod secrets;
 mod tunnel;
 
 use anyhow::Result;
@@ -47,6 +49,12 @@ enum Command {
         /// Shared secret for GitHub webhooks. Webhooks are rejected when unset.
         #[arg(long, env = "MOLOKO_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
+        /// Runner image for a GitHub workflow `runs-on` label, as label=image. Repeatable or comma-separated.
+        #[arg(long = "gha-image", env = "MOLOKO_GHA_IMAGES", value_delimiter = ',')]
+        gha_images: Vec<String>,
+        /// GitHub token for workflow runs (`secrets.GITHUB_TOKEN`) and for fetching private actions.
+        #[arg(long, env = "MOLOKO_GITHUB_TOKEN", hide_env_values = true)]
+        github_token: Option<String>,
     },
     /// Run a deploy agent on a target server. It connects out to the moloko server.
     Agent {
@@ -74,7 +82,7 @@ enum Command {
         #[arg(long, env = "MOLOKO_WORKDIR", default_value = ".")]
         workdir: PathBuf,
     },
-    /// Check a .moloko.yml and print the job graph.
+    /// Check a .moloko.yml or a GitHub workflow file and print the job graph.
     Validate {
         #[arg(default_value = config::PIPELINE_FILE)]
         file: PathBuf,
@@ -98,6 +106,8 @@ async fn main() -> Result<()> {
             registry_host,
             wg_listen,
             wg_endpoint,
+            gha_images,
+            github_token,
         } => {
             let executors = executors.unwrap_or_else(|| {
                 std::thread::available_parallelism()
@@ -105,7 +115,11 @@ async fn main() -> Result<()> {
                     .unwrap_or(4)
             });
             let registry_host = registry_host.unwrap_or_else(|| default_registry_host(&listen));
-            let engine = engine::Engine::new(&data, executors, &registry_host)?;
+            let gha_config = gha::GhaConfig {
+                images: gha::GhaConfig::parse_images(&gha_images.join(","))?,
+                github_token: github_token.filter(|t| !t.is_empty()),
+            };
+            let engine = engine::Engine::new(&data, executors, &registry_host, gha_config)?;
             let wg = if wg_listen == "off" {
                 None
             } else {
@@ -153,7 +167,29 @@ async fn main() -> Result<()> {
             _ => anyhow::bail!("pass --join <code>, or --server and --token"),
         },
         Command::Validate { file } => {
-            let pipeline = config::Pipeline::parse(&std::fs::read_to_string(&file)?)?;
+            let src = std::fs::read_to_string(&file)?;
+            let is_workflow = gha::workflow::yaml_to_json(&src)
+                .map(|v| v.get("on").is_some())
+                .unwrap_or(false);
+            if is_workflow {
+                let wf = gha::workflow::Workflow::parse(&src)?;
+                println!("{}", wf.display_name(&file.display().to_string()));
+                for id in wf.jobs.keys() {
+                    let job = wf.job(id)?;
+                    let matrix = if job.strategy.as_ref().and_then(|s| s.matrix.as_ref()).is_some() {
+                        " (matrix)"
+                    } else {
+                        ""
+                    };
+                    if job.needs.is_empty() {
+                        println!("  {id}{matrix}");
+                    } else {
+                        println!("  {id}{matrix}  <- {}", job.needs.join(", "));
+                    }
+                }
+                return Ok(());
+            }
+            let pipeline = config::Pipeline::parse(&src)?;
             for job in pipeline.expand() {
                 if job.needs.is_empty() {
                     println!("{}", job.name);

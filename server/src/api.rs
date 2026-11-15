@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use futures_util::Stream;
 use hmac::{Hmac, KeyInit, Mac};
@@ -51,7 +51,24 @@ impl WgServer {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/projects", get(list_projects).post(create_project))
-        .route("/api/projects/{id}/runs", post(trigger_run))
+        .route(
+            "/api/projects/{id}",
+            patch(rename_project).delete(delete_project),
+        )
+        .route("/api/projects/{id}/repos", post(create_repo))
+        .route("/api/repos/{id}", patch(update_repo).delete(delete_repo))
+        .route("/api/repos/{id}/runs", post(trigger_run))
+        .route("/api/repos/{id}/workflows", get(repo_workflows))
+        .route("/api/projects/{id}/secrets", get(list_project_secrets))
+        .route(
+            "/api/projects/{id}/secrets/{name}",
+            put(put_project_secret).delete(delete_project_secret),
+        )
+        .route("/api/repos/{id}/secrets", get(list_repo_secrets))
+        .route(
+            "/api/repos/{id}/secrets/{name}",
+            put(put_repo_secret).delete(delete_repo_secret),
+        )
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/cancel", post(cancel_run))
@@ -62,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents/{id}/join", post(rotate_join))
         .route("/api/agents/connect", get(agent_connect))
         .route("/api/images", get(list_images))
+        .route("/api/downloads", get(list_downloads).post(start_download))
         .route("/v2", any(registry))
         .route("/v2/", any(registry))
         .route("/v2/{*rest}", any(registry))
@@ -98,31 +116,148 @@ async fn list_projects(State(s): State<AppState>) -> ApiResult<impl IntoResponse
 }
 
 #[derive(Deserialize)]
-struct NewProject {
+struct ProjectBody {
     name: String,
-    repo_url: String,
 }
 
 async fn create_project(
     State(s): State<AppState>,
-    Json(p): Json<NewProject>,
+    Json(p): Json<ProjectBody>,
 ) -> ApiResult<impl IntoResponse> {
-    let (name, url) = (p.name.trim(), p.repo_url.trim());
-    if name.is_empty() || url.is_empty() {
-        return Err(bad_request("name and repo_url are required"));
+    let name = p.name.trim();
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
     }
     let id = s
         .engine
         .db
-        .create_project(name, url)
+        .create_project(name)
         .map_err(|e| bad_request(format!("{e:#}")))?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
+}
+
+async fn rename_project(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(p): Json<ProjectBody>,
+) -> ApiResult<impl IntoResponse> {
+    let name = p.name.trim();
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
+    }
+    match s.engine.db.rename_project(id, name) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(not_found()),
+        Err(e) => Err(bad_request(format!("{e:#}"))),
+    }
+}
+
+async fn delete_project(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    let repos = s
+        .engine
+        .db
+        .delete_project(id)
+        .map_err(|e| ApiError(StatusCode::CONFLICT, format!("{e:#}")))?
+        .ok_or_else(not_found)?;
+    for r in repos {
+        s.engine.forget_repo(r).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct NewRepo {
+    /// Defaults to the last path segment of the URL.
+    name: Option<String>,
+    url: String,
+}
+
+/// `git@github.com:acme/api.git` -> `api`
+fn repo_name_from_url(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    u.rsplit(['/', ':']).next().unwrap_or(u).to_string()
+}
+
+async fn create_repo(
+    State(s): State<AppState>,
+    Path(project_id): Path<i64>,
+    Json(r): Json<NewRepo>,
+) -> ApiResult<impl IntoResponse> {
+    let url = r.url.trim();
+    if url.is_empty() {
+        return Err(bad_request("url is required"));
+    }
+    let name = match r.name.as_deref().map(str::trim) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => repo_name_from_url(url),
+    };
+    if !s.engine.db.project_exists(project_id)? {
+        return Err(not_found());
+    }
+    let id = s
+        .engine
+        .db
+        .create_repo(project_id, &name, url)
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
+}
+
+#[derive(Deserialize)]
+struct RepoPatch {
+    name: Option<String>,
+    url: Option<String>,
+}
+
+async fn update_repo(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(p): Json<RepoPatch>,
+) -> ApiResult<impl IntoResponse> {
+    let name = p.name.as_deref().map(str::trim);
+    let url = p.url.as_deref().map(str::trim);
+    if name == Some("") || url == Some("") {
+        return Err(bad_request("name and url can't be empty"));
+    }
+    let old = s.engine.db.repo(id)?.ok_or_else(not_found)?;
+    let url = url.filter(|u| *u != old.url);
+    match s.engine.db.update_repo(id, name, url) {
+        Ok(true) => {}
+        Ok(false) => return Err(not_found()),
+        Err(e) => return Err(ApiError(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
+    // The mirror was cloned from the old URL; the next run clones from the new one.
+    if url.is_some() {
+        s.engine.forget_repo(id).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_repo(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<impl IntoResponse> {
+    match s.engine.db.delete_repo(id) {
+        Ok(true) => {
+            s.engine.forget_repo(id).await;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(false) => Err(not_found()),
+        Err(e) => Err(ApiError(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
 }
 
 #[derive(Deserialize)]
 struct TriggerBody {
     #[serde(rename = "ref")]
     git_ref: Option<String>,
+    /// Run only this pipeline (`.moloko.yml` or a workflow file).
+    workflow: Option<String>,
+    /// `workflow_dispatch` inputs.
+    #[serde(default)]
+    inputs: serde_json::Map<String, serde_json::Value>,
 }
 
 async fn trigger_run(
@@ -130,20 +265,130 @@ async fn trigger_run(
     Path(id): Path<i64>,
     body: Option<Json<TriggerBody>>,
 ) -> ApiResult<impl IntoResponse> {
-    if s.engine.db.project(id)?.is_none() {
+    if s.engine.db.repo(id)?.is_none() {
         return Err(not_found());
     }
+    let body = body.map(|b| b.0);
     let git_ref = body
-        .and_then(|b| b.0.git_ref)
+        .as_ref()
+        .and_then(|b| b.git_ref.clone())
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| "HEAD".into());
-    let run_id = s.engine.trigger(id, git_ref.trim(), None, "manual")?;
+    let dispatch = body
+        .map(|b| crate::engine::Dispatch {
+            workflow: b.workflow.filter(|w| !w.is_empty()),
+            inputs: b.inputs,
+        })
+        .unwrap_or_default();
+    let run_id = s
+        .engine
+        .trigger(id, git_ref.trim(), None, None, "manual", dispatch)?;
     Ok((StatusCode::CREATED, Json(json!({ "id": run_id }))))
+}
+
+// ---------- secrets: write-only; values are never returned ----------
+
+fn project_scope(s: &AppState, id: i64) -> ApiResult<crate::secrets::Scope> {
+    if !s.engine.db.project_exists(id)? {
+        return Err(not_found());
+    }
+    Ok(crate::secrets::Scope::Project(id))
+}
+
+fn repo_scope(s: &AppState, id: i64) -> ApiResult<crate::secrets::Scope> {
+    s.engine.db.repo(id)?.ok_or_else(not_found)?;
+    Ok(crate::secrets::Scope::Repo(id))
+}
+
+#[derive(Deserialize)]
+struct SecretBody {
+    value: String,
+}
+
+fn list_secrets(s: &AppState, scope: crate::secrets::Scope) -> ApiResult<Json<Vec<crate::db::SecretInfo>>> {
+    Ok(Json(s.engine.db.secret_names(&scope.key())?))
+}
+
+fn put_secret(s: &AppState, scope: crate::secrets::Scope, name: &str, value: &str) -> ApiResult<StatusCode> {
+    let name = crate::secrets::normalize_name(name).map_err(|e| bad_request(e.to_string()))?;
+    if value.is_empty() {
+        return Err(bad_request("value is required"));
+    }
+    if value.len() > crate::secrets::MAX_VALUE_BYTES {
+        return Err(bad_request("secrets are limited to 48 KB"));
+    }
+    let (nonce, sealed) = s.engine.vault.seal(scope, &name, value)?;
+    s.engine.db.put_secret(&scope.key(), &name, &nonce, &sealed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn delete_secret(s: &AppState, scope: crate::secrets::Scope, name: &str) -> ApiResult<StatusCode> {
+    let name = crate::secrets::normalize_name(name).map_err(|e| bad_request(e.to_string()))?;
+    if s.engine.db.delete_secret(&scope.key(), &name)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
+}
+
+async fn list_project_secrets(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
+    list_secrets(&s, project_scope(&s, id)?)
+}
+
+async fn put_project_secret(
+    State(s): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+    Json(b): Json<SecretBody>,
+) -> ApiResult<impl IntoResponse> {
+    put_secret(&s, project_scope(&s, id)?, &name, &b.value)
+}
+
+async fn delete_project_secret(State(s): State<AppState>, Path((id, name)): Path<(i64, String)>) -> ApiResult<impl IntoResponse> {
+    delete_secret(&s, project_scope(&s, id)?, &name)
+}
+
+async fn list_repo_secrets(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
+    list_secrets(&s, repo_scope(&s, id)?)
+}
+
+async fn put_repo_secret(
+    State(s): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+    Json(b): Json<SecretBody>,
+) -> ApiResult<impl IntoResponse> {
+    put_secret(&s, repo_scope(&s, id)?, &name, &b.value)
+}
+
+async fn delete_repo_secret(State(s): State<AppState>, Path((id, name)): Path<(i64, String)>) -> ApiResult<impl IntoResponse> {
+    delete_secret(&s, repo_scope(&s, id)?, &name)
+}
+
+#[derive(Deserialize)]
+struct RefQuery {
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+}
+
+/// Pipelines a manual run can start, with their inputs (syncs the repo first).
+async fn repo_workflows(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<RefQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let repo = s.engine.db.repo(id)?.ok_or_else(not_found)?;
+    let git_ref = q.git_ref.filter(|r| !r.trim().is_empty()).unwrap_or_else(|| "HEAD".into());
+    let list = s
+        .engine
+        .manual_pipelines(&repo, git_ref.trim())
+        .await
+        .map_err(|e| bad_request(format!("{e:#}")))?;
+    Ok(Json(list))
 }
 
 #[derive(Deserialize)]
 struct RunsQuery {
     project_id: Option<i64>,
+    repo_id: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -151,16 +396,36 @@ async fn list_runs(
     State(s): State<AppState>,
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    Ok(Json(
-        s.engine
-            .db
-            .runs(q.project_id, q.limit.unwrap_or(50).clamp(1, 500))?,
-    ))
+    #[derive(serde::Serialize)]
+    struct RunWithJobs {
+        #[serde(flatten)]
+        run: crate::db::Run,
+        jobs: Vec<crate::db::Job>,
+    }
+    let runs = s
+        .engine
+        .db
+        .runs(q.project_id, q.repo_id, q.limit.unwrap_or(50).clamp(1, 500))?;
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs {
+        let jobs = jobs_with_steps(&s, run.id)?;
+        out.push(RunWithJobs { run, jobs });
+    }
+    Ok(Json(out))
+}
+
+/// A run's jobs, each running one with the step it is on.
+fn jobs_with_steps(s: &AppState, run_id: i64) -> anyhow::Result<Vec<crate::db::Job>> {
+    let mut jobs = s.engine.db.jobs(run_id)?;
+    for j in jobs.iter_mut().filter(|j| j.status == "running") {
+        j.step = s.engine.logs.step(j.id);
+    }
+    Ok(jobs)
 }
 
 async fn get_run(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
     let run = s.engine.db.run(id)?.ok_or_else(not_found)?;
-    let jobs = s.engine.db.jobs(id)?;
+    let jobs = jobs_with_steps(&s, id)?;
     Ok(Json(json!({ "run": run, "jobs": jobs })))
 }
 
@@ -201,7 +466,8 @@ async fn job_logs(
                 }
             }
         }
-        yield Ok(Event::default().event("end").data(""));
+        // Browsers drop SSE events with empty data, which would make them reconnect and replay the log.
+        yield Ok(Event::default().event("end").data("end"));
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -353,6 +619,22 @@ async fn agent_connect(
     }))
 }
 
+async fn list_downloads(State(s): State<AppState>) -> impl IntoResponse {
+    Json(crate::gha::setup::list(&s.engine.gha).await)
+}
+
+#[derive(Deserialize)]
+struct DownloadBody {
+    id: String,
+}
+
+async fn start_download(State(s): State<AppState>, Json(b): Json<DownloadBody>) -> ApiResult<impl IntoResponse> {
+    if !crate::gha::setup::start(&s.engine, &b.id) {
+        return Err(not_found());
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
 async fn list_images(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
     Ok(Json(json!({
         "registry": s.engine.registry_host,
@@ -412,6 +694,8 @@ pub fn verify_signature(secret: &str, body: &[u8], header: Option<&str>) -> bool
 struct PushEvent {
     #[serde(rename = "ref")]
     git_ref: String,
+    #[serde(default)]
+    before: Option<String>,
     after: String,
     #[serde(default)]
     deleted: bool,
@@ -461,11 +745,18 @@ async fn github_webhook(
     .map(|u| normalize_repo_url(u))
     .collect();
     let mut runs = Vec::new();
-    for p in s.engine.db.projects()? {
-        if urls.contains(&normalize_repo_url(&p.repo_url)) {
+    for r in s.engine.db.repos()? {
+        if urls.contains(&normalize_repo_url(&r.url)) {
             runs.push(
                 s.engine
-                    .trigger(p.id, &ev.git_ref, Some(&ev.after), "push")?,
+                    .trigger(
+                        r.id,
+                        &ev.git_ref,
+                        Some(&ev.after),
+                        ev.before.as_deref(),
+                        "push",
+                        Default::default(),
+                    )?,
             );
         }
     }
@@ -526,6 +817,18 @@ mod tests {
             "ssh://git@github.com:22/acme/api.git",
         ] {
             assert_eq!(normalize_repo_url(u), want, "{u}");
+        }
+    }
+
+    #[test]
+    fn repo_names_from_urls() {
+        for u in [
+            "git@github.com:acme/api.git",
+            "https://github.com/acme/api",
+            "https://github.com/acme/api/",
+            "/srv/git/api.git",
+        ] {
+            assert_eq!(repo_name_from_url(u), "api", "{u}");
         }
     }
 

@@ -837,7 +837,7 @@ mod http_tests {
     #[tokio::test]
     async fn push_pull_and_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::new(&dir.path().join("data"), 1, "localhost:0").unwrap();
+        let engine = Engine::new(&dir.path().join("data"), 1, "localhost:0", Default::default()).unwrap();
         engine.registry.grant_run_token("runtok");
         let agent_token = crate::agents::new_token();
         engine

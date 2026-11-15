@@ -1,4 +1,4 @@
-//! Local git mirror per project. Jobs check out via `git worktree`, so a checkout
+//! Local git mirror per repo. Jobs check out via `git worktree`, so a checkout
 //! costs a few file writes instead of a network clone.
 
 use anyhow::{Context, Result, bail};
@@ -37,28 +37,28 @@ impl GitCache {
         }
     }
 
-    fn lock(&self, project_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn lock(&self, repo_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
             .unwrap()
-            .entry(project_id)
+            .entry(repo_id)
             .or_default()
             .clone()
     }
 
-    pub fn mirror_path(&self, project_id: i64) -> PathBuf {
-        self.root.join(format!("{project_id}.git"))
+    pub fn mirror_path(&self, repo_id: i64) -> PathBuf {
+        self.root.join(format!("{repo_id}.git"))
     }
 
     /// Clone the mirror on first use, otherwise fetch only what changed.
-    pub async fn sync(&self, project_id: i64, url: &str) -> Result<PathBuf> {
-        let lock = self.lock(project_id);
+    pub async fn sync(&self, repo_id: i64, url: &str) -> Result<PathBuf> {
+        let lock = self.lock(repo_id);
         let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
+        let mirror = self.mirror_path(repo_id);
         if mirror.join("HEAD").exists() {
             git(&["fetch", "--prune", "--quiet", "origin"], Some(&mirror)).await?;
         } else {
-            let tmp = self.root.join(format!("{project_id}.git.tmp"));
+            let tmp = self.root.join(format!("{repo_id}.git.tmp"));
             let _ = tokio::fs::remove_dir_all(&tmp).await;
             git(
                 &["clone", "--mirror", "--quiet", url, tmp.to_str().unwrap()],
@@ -88,10 +88,45 @@ impl GitCache {
         git(&["show", &format!("{sha}:{path}")], Some(mirror)).await
     }
 
-    pub async fn checkout(&self, project_id: i64, sha: &str, dest: &Path) -> Result<()> {
-        let lock = self.lock(project_id);
+    /// File names directly inside `dir` at `sha` (empty if the directory doesn't exist).
+    pub async fn list_dir(&self, mirror: &Path, sha: &str, dir: &str) -> Vec<String> {
+        git(&["ls-tree", "--name-only", &format!("{sha}:{dir}")], Some(mirror))
+            .await
+            .map(|o| o.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Files changed between two commits; None if `before` is unknown (e.g. a new branch).
+    pub async fn changed_files(&self, mirror: &Path, before: &str, after: &str) -> Option<Vec<String>> {
+        if before.chars().all(|c| c == '0') {
+            return None;
+        }
+        git(&["diff", "--name-only", before, after], Some(mirror))
+            .await
+            .ok()
+            .map(|o| o.lines().map(str::to_string).collect())
+    }
+
+    /// Expand `main`, `v1.0` or `HEAD` to a full ref (`refs/heads/main`); empty for a bare sha.
+    pub async fn full_ref(&self, mirror: &Path, git_ref: &str) -> String {
+        if git_ref.starts_with("refs/") {
+            return git_ref.to_string();
+        }
+        if git_ref == "HEAD" {
+            return git(&["symbolic-ref", "HEAD"], Some(mirror)).await.unwrap_or_default();
+        }
+        for candidate in [format!("refs/heads/{git_ref}"), format!("refs/tags/{git_ref}")] {
+            if git(&["show-ref", "--verify", "--quiet", &candidate], Some(mirror)).await.is_ok() {
+                return candidate;
+            }
+        }
+        String::new()
+    }
+
+    pub async fn checkout(&self, repo_id: i64, sha: &str, dest: &Path) -> Result<()> {
+        let lock = self.lock(repo_id);
         let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
+        let mirror = self.mirror_path(repo_id);
         git(
             &[
                 "worktree",
@@ -107,10 +142,17 @@ impl GitCache {
         Ok(())
     }
 
-    pub async fn remove(&self, project_id: i64, dest: &Path) {
-        let lock = self.lock(project_id);
+    /// Delete the repo's mirror, e.g. after its URL changed or the repo was deleted.
+    pub async fn forget(&self, repo_id: i64) {
+        let lock = self.lock(repo_id);
         let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
+        let _ = tokio::fs::remove_dir_all(self.mirror_path(repo_id)).await;
+    }
+
+    pub async fn remove(&self, repo_id: i64, dest: &Path) {
+        let lock = self.lock(repo_id);
+        let _g = lock.lock().await;
+        let mirror = self.mirror_path(repo_id);
         if git(
             &["worktree", "remove", "--force", dest.to_str().unwrap()],
             Some(&mirror),

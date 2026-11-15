@@ -480,10 +480,11 @@ jobs:
     steps: [echo never]
 "#;
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline)]).await;
-        let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0").unwrap();
-        let pid = engine
+        let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0", Default::default()).unwrap();
+        let pid = engine.db.create_project("demo").unwrap();
+        let rid = engine
             .db
-            .create_project("demo", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap())
             .unwrap();
         let token = new_token();
         engine
@@ -523,7 +524,7 @@ jobs:
         }
         assert!(engine.agents.presence().values().any(|p| !p.os.is_empty()));
 
-        let run = engine.trigger(pid, "main", None, "manual").unwrap();
+        let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         assert_eq!(wait_run(&engine, run).await, "failed"); // `nowhere` has no agent
         let jobs = engine.db.jobs(run).unwrap();
         let deploy = jobs.iter().find(|j| j.name == "deploy").unwrap();

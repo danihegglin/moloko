@@ -8,20 +8,46 @@ export type Route =
   | { page: 'images' }
   | { page: 'settings' }
 
-// Hash routes: #/ (runs), #/runs/:id, #/runs/:id/:job, #/projects, #/images, #/deployments (also #/agents), #/settings
+const CHANGE = 'moloko:route'
+
+/** Go to another page without reloading. `replace` swaps the current history entry instead of adding one. */
+export function navigate(path: string, replace = false) {
+  history[replace ? 'replaceState' : 'pushState'](null, '', path)
+  if (!replace) scrollTo(0, 0)
+  dispatchEvent(new Event(CHANGE))
+}
+
+// Routes: / (runs), /runs/:id, /runs/:id/:job, /projects, /images, /deployments, /settings
 export function useRoute(): Route {
-  const [hash, setHash] = useState(location.hash)
+  const [path, setPath] = useState(location.pathname)
   useEffect(() => {
-    const on = () => setHash(location.hash)
-    addEventListener('hashchange', on)
-    return () => removeEventListener('hashchange', on)
+    // Addresses used to be `/#/projects`; keep old bookmarks working.
+    if (location.hash.startsWith('#/')) history.replaceState(null, '', location.hash.slice(1))
+    const on = () => setPath(location.pathname)
+    on()
+    // Plain clicks on links to dashboard pages change the page in place.
+    const click = (e: MouseEvent) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+      const a = (e.target as Element).closest?.('a[href]') as HTMLAnchorElement | null
+      if (!a || a.target || a.origin !== location.origin || a.pathname.startsWith('/api/')) return
+      e.preventDefault()
+      navigate(a.pathname + a.search)
+    }
+    addEventListener('popstate', on)
+    addEventListener(CHANGE, on)
+    document.addEventListener('click', click)
+    return () => {
+      removeEventListener('popstate', on)
+      removeEventListener(CHANGE, on)
+      document.removeEventListener('click', click)
+    }
   }, [])
-  const m = hash.match(/^#\/runs\/(\d+)(?:\/(\d+))?/)
+  const m = path.match(/^\/runs\/(\d+)(?:\/(\d+))?/)
   if (m) return { page: 'run', id: Number(m[1]), job: m[2] ? Number(m[2]) : undefined }
-  if (hash.startsWith('#/projects')) return { page: 'projects' }
-  if (hash.startsWith('#/deployments') || hash.startsWith('#/agents')) return { page: 'agents' }
-  if (hash.startsWith('#/images')) return { page: 'images' }
-  if (hash.startsWith('#/settings')) return { page: 'settings' }
+  if (path.startsWith('/projects')) return { page: 'projects' }
+  if (path.startsWith('/deployments') || path.startsWith('/agents')) return { page: 'agents' }
+  if (path.startsWith('/images')) return { page: 'images' }
+  if (path.startsWith('/settings')) return { page: 'settings' }
   return { page: 'runs' }
 }
 

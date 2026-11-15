@@ -30,19 +30,12 @@ export function RunsPage() {
 
   return (
     <>
-      <div className="mb-8 flex items-center gap-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Runs</h1>
-        {repos.length > 0 && (
-          <Button className="ml-auto" onClick={() => setRunning(true)}>
-            <PlayIcon className="fill-current" /> New run
-          </Button>
-        )}
-      </div>
       <TriggerDialog open={running} onOpenChange={setRunning} projects={projects.data ?? []} defaultRepo={defaultRepo} />
 
       {runs.error && <ErrorNote>{runs.error}</ErrorNote>}
 
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+      <div className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-3">
+        <h1 className="mr-2 text-2xl font-semibold tracking-tight">Runs</h1>
         <div className="inline-flex rounded-lg border bg-card p-0.5 shadow-xs">
           {TABS.map(([t, label]) => {
             const n = groups.filter((g) => inTab(t, groupStatus(g))).length
@@ -60,7 +53,7 @@ export function RunsPage() {
           })}
         </div>
         <Select value={filter} onValueChange={setFilter}>
-          <SelectTrigger className="w-52 bg-card shadow-xs">
+          <SelectTrigger className="ml-auto w-48 bg-card shadow-xs">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -79,6 +72,11 @@ export function RunsPage() {
             ))}
           </SelectContent>
         </Select>
+        {repos.length > 0 && (
+          <Button onClick={() => setRunning(true)}>
+            <PlayIcon className="fill-current" /> New run
+          </Button>
+        )}
       </div>
 
       {!runs.data ? (
@@ -88,7 +86,7 @@ export function RunsPage() {
           {repos.length === 0 ? (
             <>
               Add a repository under{' '}
-              <a href="#/projects" className="text-foreground underline underline-offset-4">
+              <a href="/projects" className="text-foreground underline underline-offset-4">
                 Projects
               </a>
               .
@@ -141,7 +139,7 @@ function GroupRow({ runs, now }: { runs: RunWithJobs[]; now: number }) {
   const [start, end] = groupSpan(runs)
   return (
     <li>
-      <a href={`#/runs/${groupFocus(runs).id}`} className="group flex items-center gap-4 px-4 py-3.5 transition-colors hover:bg-muted/50">
+      <a href={`/runs/${groupFocus(runs).id}`} className="group flex items-center gap-4 px-4 py-3.5 transition-colors hover:bg-muted/50">
         <StatusIcon status={status} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 text-sm">
@@ -183,7 +181,7 @@ function GroupRow({ runs, now }: { runs: RunWithJobs[]; now: number }) {
           {runs.map((r) => (
             <div key={r.id}>
               {runs.length > 1 && (
-                <a href={`#/runs/${r.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] font-medium transition-colors hover:bg-foreground/5">
+                <a href={`/runs/${r.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] font-medium transition-colors hover:bg-foreground/5">
                   <StatusIcon status={r.status} className="size-3.5" />
                   <span className="min-w-0 flex-1 truncate">{r.workflow ?? r.repo_name}</span>
                   <span className="shrink-0 text-xs font-normal text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now) || STATUS_LABEL[r.status].toLowerCase()}</span>
@@ -206,7 +204,7 @@ function ActiveJobs({ runId, jobs, now, nested }: { runId: number; jobs: Job[]; 
         .filter((j) => j.status !== 'skipped')
         .map((j) => (
           <li key={j.id}>
-            <a href={`#/runs/${runId}/${j.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] transition-colors hover:bg-foreground/5">
+            <a href={`/runs/${runId}/${j.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] transition-colors hover:bg-foreground/5">
               <StatusIcon status={j.status} className="size-3.5" />
               <span className={cn('shrink-0', j.status !== 'running' && 'text-muted-foreground')}>{j.name}</span>
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{j.status === 'queued' ? 'Waiting' : j.step?.replace(/^▶ /, '')}</span>

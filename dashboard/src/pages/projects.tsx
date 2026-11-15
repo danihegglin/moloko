@@ -137,7 +137,7 @@ function RepoRow({ repo, last, now, onChange, onRun }: { repo: Repo; last?: RunW
         <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">{repo.url}</div>
       </div>
       {last ? (
-        <a href={`#/runs/${last.id}`} className="hidden items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:flex" title="Latest run">
+        <a href={`/runs/${last.id}`} className="hidden items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:flex" title="Latest run">
           <StatusIcon status={last.status} className="size-3.5" />
           <span className="max-w-32 truncate">{last.workflow ?? 'Run'}</span>
           <span className="font-mono">#{last.group_id}</span>

@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDownIcon, ChevronRightIcon, TriangleAlertIcon } from 'lucide-react'
 import { api, duration, groupSpan, groupStatus, isActive, jobCounts, type Job, type RunWithJobs } from '@/api'
-import { useNow, usePoll } from '@/hooks'
+import { navigate, useNow, usePoll } from '@/hooks'
 import { cn } from '@/lib/utils'
 import { attempt, Card, CopyButton, ErrorNote, JobBar, ListSkeleton, RefChip, Sha, StatusBadge, StatusIcon, Trigger } from '@/components/common'
 import { Button } from '@/components/ui/button'
@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 export function RunPage({ id, job }: { id: number; job?: number }) {
   const { data, error } = usePoll(() => api.run(id), 1000, [id], (d) => d.group.some((r) => isActive(r.status)))
   // The selected job lives in the URL, so the runs list can link straight to one.
-  const select = (jobId: number) => location.replace(`#/runs/${id}/${jobId}`)
+  const select = (jobId: number) => navigate(`/runs/${id}/${jobId}`, true)
   const now = useNow()
 
   // Follow the first running (or failed) job until the user picks one.
@@ -30,7 +30,7 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
   return (
     <>
       <nav className="mb-5 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <a href="#/" className="transition-colors hover:text-foreground">
+        <a href="/" className="transition-colors hover:text-foreground">
           Runs
         </a>
         <ChevronRightIcon className="size-3.5 opacity-60" />
@@ -152,7 +152,7 @@ function Pipelines({ group, selected, now }: { group: RunWithJobs[]; selected: n
         {group.map((r) => (
           <a
             key={r.id}
-            href={`#/runs/${r.id}`}
+            href={`/runs/${r.id}`}
             aria-current={r.id === selected ? 'true' : undefined}
             className={cn(
               'rounded-xl border bg-card p-3.5 shadow-xs transition-colors hover:border-foreground/30',

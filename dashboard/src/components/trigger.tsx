@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, type Pipeline, type PipelineInput, type Project } from '@/api'
+import { navigate } from '@/hooks'
 import { attempt } from '@/components/common'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -81,7 +82,7 @@ export function TriggerDialog({
     setBusy(false)
     if (ok) {
       onOpenChange(false)
-      location.hash = `#/runs/${id}`
+      navigate(`/runs/${id}`)
     }
   }
 

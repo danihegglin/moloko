@@ -15,10 +15,10 @@ import { ImagesPage } from '@/pages/images'
 import { SettingsPage } from '@/pages/settings'
 
 const NAV: { href: string; label: string; match: Route['page'][] }[] = [
-  { href: '#/', label: 'Runs', match: ['runs', 'run'] },
-  { href: '#/projects', label: 'Projects', match: ['projects'] },
-  { href: '#/images', label: 'Images', match: ['images'] },
-  { href: '#/deployments', label: 'Deployments', match: ['agents'] },
+  { href: '/projects', label: 'Projects', match: ['projects'] },
+  { href: '/', label: 'Runs', match: ['runs', 'run'] },
+  { href: '/images', label: 'Images', match: ['images'] },
+  { href: '/deployments', label: 'Deployments', match: ['agents'] },
 ]
 
 const TITLE: Record<Route['page'], string> = { runs: 'Runs', run: 'Run', projects: 'Projects', agents: 'Deployments', images: 'Images', settings: 'Settings' }
@@ -43,7 +43,7 @@ function Shell() {
     <div className="min-h-svh">
       <header className="sticky top-0 z-30 border-b bg-background/85 backdrop-blur-md">
         <div className="mx-auto flex h-14 max-w-6xl items-center gap-6 px-4 sm:px-6">
-          <a href="#/" className="flex items-center gap-2.5 text-[15px] font-semibold tracking-tight">
+          <a href="/" className="flex items-center gap-2.5 text-[15px] font-semibold tracking-tight">
             <Logo />
             moloko
           </a>
@@ -70,7 +70,7 @@ function Shell() {
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon-sm" className={cn('text-muted-foreground', route.page === 'settings' && 'bg-foreground/[0.06] text-foreground dark:bg-foreground/10')} asChild>
-                  <a href="#/settings" aria-label="Settings">
+                  <a href="/settings" aria-label="Settings">
                     <SettingsIcon />
                   </a>
                 </Button>
@@ -116,7 +116,7 @@ function Activity() {
   const waiting = runs.data?.some((r) => isActive(r.status)) ?? false
   if (!jobs && !waiting) return null
   return (
-    <a href="#/" className="mr-2 hidden h-7 items-center gap-2 rounded-full border border-running/25 bg-running/10 px-3 text-xs font-medium text-running sm:inline-flex">
+    <a href="/" className="mr-2 hidden h-7 items-center gap-2 rounded-full border border-running/25 bg-running/10 px-3 text-xs font-medium text-running sm:inline-flex">
       <span className="size-1.5 animate-pulse rounded-full bg-current" />
       {jobs ? `${jobs} ${jobs === 1 ? 'job' : 'jobs'} running` : 'Runs queued'}
     </a>

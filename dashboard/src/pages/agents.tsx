@@ -23,10 +23,10 @@ export function AgentsPage() {
     <>
       <PageHeader
         title="Deployments"
-        description={agents.data?.length ? `Deploy agents run on your servers and connect out to moloko. ${online} of ${agents.data.length} connected.` : 'Deploy agents run on your servers and connect out to moloko.'}
+        description={agents.data?.length ? `Connectors run on your servers and connect out to moloko. ${online} of ${agents.data.length} connected.` : 'Connectors run on your servers and connect out to moloko.'}
       >
         <Button onClick={() => setAdding(true)}>
-          <PlusIcon /> Add agent
+          <PlusIcon /> Add connector
         </Button>
       </PageHeader>
       <AddAgentDialog
@@ -43,8 +43,8 @@ export function AgentsPage() {
       {!agents.data ? (
         <ListSkeleton rows={3} />
       ) : agents.data.length === 0 ? (
-        <EmptyState icon={ServerIcon} title="No agents yet" action={<Button onClick={() => setAdding(true)}>Add agent</Button>}>
-          Add an agent, run the join command on a server, then target it from a pipeline with <code className="font-mono">agent: &lt;label&gt;</code>.
+        <EmptyState icon={ServerIcon} title="No connectors yet" action={<Button onClick={() => setAdding(true)}>Add connector</Button>}>
+          Add a connector, run the join command on a server, then target it from a pipeline with <code className="font-mono">agent: &lt;label&gt;</code>.
         </EmptyState>
       ) : (
         <Card>
@@ -118,7 +118,7 @@ function AgentRowItem({ row, now, onDeleted, onRotated }: { row: AgentRow; now: 
         open={dialog === 'rotate'}
         onOpenChange={close}
         title={`New join code for ${agent.name}?`}
-        description="The current code stops working and the agent is disconnected."
+        description="The current code stops working and the connector is disconnected."
         action="Issue new code"
         destructive={false}
         onConfirm={async () => {
@@ -134,7 +134,7 @@ function AgentRowItem({ row, now, onDeleted, onRotated }: { row: AgentRow; now: 
         onOpenChange={close}
         title={`Delete ${agent.name}?`}
         description="Its token stops working immediately."
-        action="Delete agent"
+        action="Delete connector"
         onConfirm={() => attempt(() => api.deleteAgent(agent.id), `Deleted ${agent.name}`).then(onDeleted)}
       />
     </li>
@@ -160,7 +160,7 @@ function AddAgentDialog({ open, onOpenChange, onCreated }: { open: boolean; onOp
       <DialogContent className="sm:max-w-md">
         <form onSubmit={submit} className="grid gap-5">
           <DialogHeader>
-            <DialogTitle>Add agent</DialogTitle>
+            <DialogTitle>Add connector</DialogTitle>
             <DialogDescription>You'll get a one-time join code to run on the server.</DialogDescription>
           </DialogHeader>
           <div className="grid gap-2">

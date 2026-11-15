@@ -24,7 +24,7 @@ const LABEL: Record<Status, string> = {
   cancelled: 'Cancelled',
 }
 
-/** Monochrome status: solid = passed, ring = running, hollow = waiting/skipped, red = failed. */
+/** Status: green = passed, red = failed, ring = running, hollow = waiting/skipped. */
 export function StatusDot({ status, className }: { status: Status; className?: string }) {
   return (
     <span
@@ -32,7 +32,7 @@ export function StatusDot({ status, className }: { status: Status; className?: s
       title={LABEL[status]}
       className={cn(
         'relative inline-flex size-2 shrink-0 rounded-full',
-        status === 'success' && 'bg-foreground',
+        status === 'success' && 'bg-success',
         status === 'failed' && 'bg-destructive',
         status === 'running' && 'border border-foreground',
         status === 'queued' && 'border border-muted-foreground',
@@ -45,7 +45,7 @@ export function StatusDot({ status, className }: { status: Status; className?: s
   )
 }
 
-/** One segment per job: filled = passed, red = failed, pulsing = running, faint = not there yet. */
+/** One segment per job: green = passed, red = failed, pulsing = running, faint = not there yet. */
 export function JobBar({ jobs, className }: { jobs: Job[]; className?: string }) {
   return (
     <div className={cn('flex h-1 gap-0.5', className)}>
@@ -55,7 +55,7 @@ export function JobBar({ jobs, className }: { jobs: Job[]; className?: string })
           title={`${j.name}: ${LABEL[j.status].toLowerCase()}`}
           className={cn(
             'min-w-1 flex-1 rounded-full',
-            j.status === 'success' && 'bg-foreground',
+            j.status === 'success' && 'bg-success',
             j.status === 'failed' && 'bg-destructive',
             j.status === 'running' && 'animate-pulse bg-foreground/50',
             (j.status === 'queued' || j.status === 'skipped' || j.status === 'cancelled') && 'bg-border',
@@ -68,7 +68,7 @@ export function JobBar({ jobs, className }: { jobs: Job[]; className?: string })
 
 export function StatusLabel({ status }: { status: Status }) {
   return (
-    <span className={cn('inline-flex items-center gap-2 text-sm', status === 'failed' ? 'text-destructive' : 'text-muted-foreground')}>
+    <span className={cn('inline-flex items-center gap-2 text-sm', status === 'failed' ? 'text-destructive' : status === 'success' ? 'text-success' : 'text-muted-foreground')}>
       <StatusDot status={status} />
       {LABEL[status]}
     </span>

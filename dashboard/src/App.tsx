@@ -1,4 +1,4 @@
-import { MoonIcon, SunIcon } from 'lucide-react'
+import { MoonIcon, SettingsIcon, SunIcon } from 'lucide-react'
 import { ThemeProvider, useTheme } from 'next-themes'
 import { useRoute, type Route } from '@/hooks'
 import { cn } from '@/lib/utils'
@@ -17,7 +17,6 @@ const NAV: { href: string; label: string; match: Route['page'][] }[] = [
   { href: '#/projects', label: 'Projects', match: ['projects'] },
   { href: '#/agents', label: 'Agents', match: ['agents'] },
   { href: '#/images', label: 'Images', match: ['images'] },
-  { href: '#/settings', label: 'Settings', match: ['settings'] },
 ]
 
 export default function App() {
@@ -54,7 +53,12 @@ function Shell() {
               </a>
             ))}
           </nav>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-1">
+            <Button variant="ghost" size="icon-sm" className={cn('text-muted-foreground', route.page === 'settings' && 'text-foreground')} asChild>
+              <a href="#/settings" aria-label="Settings" title="Settings">
+                <SettingsIcon />
+              </a>
+            </Button>
             <ThemeToggle />
           </div>
         </div>

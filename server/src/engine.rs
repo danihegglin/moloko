@@ -157,7 +157,7 @@ impl Engine {
             .db
             .repo(repo_id)?
             .ok_or_else(|| anyhow!("repo {repo_id} not found"))?;
-        let run_id = self.db.create_run(repo_id, git_ref, trigger)?;
+        let run_id = self.db.create_run(repo_id, git_ref, trigger, None)?;
         let cancel = CancellationToken::new();
         self.cancels.lock().unwrap().insert(run_id, cancel.clone());
         let this = self.clone();
@@ -181,11 +181,17 @@ impl Engine {
             };
             let repo = Arc::new(repo);
             let mut sources = std::mem::take(&mut *plan.sources.lock().unwrap());
+            if sources.is_empty() {
+                // A push that no pipeline listens for: nothing to show.
+                let _ = this.db.delete_run(run_id);
+                this.cancels.lock().unwrap().remove(&run_id);
+                return;
+            }
             for (i, source) in sources.drain(..).enumerate() {
                 let (rid, cancel) = if i == 0 {
                     (run_id, cancel.clone())
                 } else {
-                    let Ok(rid) = this.db.create_run(repo.id, &git_ref, &trigger) else {
+                    let Ok(rid) = this.db.create_run(repo.id, &git_ref, &trigger, Some(run_id)) else {
                         continue;
                     };
                     let c = CancellationToken::new();
@@ -203,6 +209,32 @@ impl Engine {
         Ok(run_id)
     }
 
+    /// Look at every polled repo's remote and start push runs for branches and tags that moved.
+    /// The first look at a repo only records where its refs are.
+    pub async fn poll_once(self: &Arc<Self>) {
+        let repos = self.db.repos().unwrap_or_default();
+        for repo in repos.into_iter().filter(|r| r.poll) {
+            if let Err(e) = self.poll_repo(&repo).await {
+                tracing::warn!(repo = %repo.name, "polling failed: {e:#}");
+            }
+        }
+    }
+
+    async fn poll_repo(self: &Arc<Self>, repo: &crate::db::Repo) -> Result<()> {
+        let refs = crate::git::ls_remote(&repo.url).await?;
+        if let Some(seen) = self.db.repo_refs(repo.id)? {
+            for (name, sha) in &refs {
+                let before = seen.get(name);
+                // note_ref: a webhook may have reported this push already.
+                if before != Some(sha) && self.db.note_ref(repo.id, name, sha)? {
+                    tracing::info!(repo = %repo.name, git_ref = %name, sha = %sha, "new commit found by polling");
+                    self.trigger(repo.id, name, Some(sha), before.map(String::as_str), "push", Default::default())?;
+                }
+            }
+        }
+        self.db.set_repo_refs(repo.id, &refs)
+    }
+
     /// Drop a repo's git mirror; the next run clones again (from the current URL).
     pub async fn forget_repo(&self, repo_id: i64) {
         self.git.forget(repo_id).await;
@@ -218,10 +250,11 @@ impl Engine {
         }
     }
 
-    /// Decrypted secrets for a repo's runs: the project's, overridden by the repo's own.
+    /// Decrypted secrets for a repo's runs: the server's, overridden by the project's, then by the repo's own.
     pub fn secrets_for(&self, repo: &crate::db::Repo) -> Result<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = Vec::new();
         for scope in [
+            crate::secrets::Scope::Server.key(),
             crate::secrets::Scope::Project(repo.project_id).key(),
             crate::secrets::Scope::Repo(repo.id).key(),
         ] {
@@ -340,7 +373,7 @@ impl Engine {
         {
             anyhow::bail!("{w} doesn't exist at {sha} or doesn't listen for {}", event.name());
         }
-        if sources.is_empty() {
+        if sources.is_empty() && !push {
             let mut msg = format!("nothing to run at {sha}: no {PIPELINE_FILE}");
             if skipped.is_empty() {
                 msg.push_str(" and no workflows in .github/workflows");
@@ -797,7 +830,7 @@ jobs:
         let pid = engine.db.create_project("demo").unwrap();
         let rid = engine
             .db
-            .create_repo(pid, "api", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap(), false)
             .unwrap();
 
         let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
@@ -845,7 +878,7 @@ jobs:
         let pid = engine.db.create_project("demo").unwrap();
         let rid = engine
             .db
-            .create_repo(pid, "api", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap(), false)
             .unwrap();
         let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         for _ in 0..100 {
@@ -896,7 +929,7 @@ jobs:
         let pid = engine.db.create_project("demo").unwrap();
         let rid = engine
             .db
-            .create_repo(pid, "api", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap(), false)
             .unwrap();
         let first = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         assert_eq!(wait_done(&engine, first).await, "success");
@@ -911,6 +944,9 @@ jobs:
         let mut names: Vec<_> = runs.iter().map(|r| r.workflow.clone().unwrap()).collect();
         names.sort();
         assert_eq!(names, [".moloko.yml", "Manual"]);
+        // One trigger, one group: both runs carry the first run's id.
+        assert!(runs.iter().all(|r| r.group_id == first));
+        assert_eq!(engine.db.run_group(first).unwrap().len(), 2);
         let manual = runs.iter().find(|r| r.workflow.as_deref() == Some("Manual")).unwrap();
         assert_eq!(manual.git_ref, "main");
         let jobs = engine.db.jobs(manual.id).unwrap();
@@ -927,7 +963,7 @@ jobs:
         .await;
         let engine = Engine::new(&dir.path().join("data"), 1, "localhost:0", Default::default()).unwrap();
         let pid = engine.db.create_project("demo").unwrap();
-        let rid = engine.db.create_repo(pid, "api", repo.to_str().unwrap()).unwrap();
+        let rid = engine.db.create_repo(pid, "api", repo.to_str().unwrap(), false).unwrap();
         let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         assert_eq!(wait_done(&engine, run).await, "failed");
         let err = engine.db.run(run).unwrap().unwrap().error.unwrap();
@@ -945,7 +981,7 @@ jobs:
         .await;
         let engine = Engine::new(&dir.path().join("data"), 1, "localhost:0", Default::default()).unwrap();
         let pid = engine.db.create_project("demo").unwrap();
-        let rid = engine.db.create_repo(pid, "app", repo.to_str().unwrap()).unwrap();
+        let rid = engine.db.create_repo(pid, "app", repo.to_str().unwrap(), false).unwrap();
         let only = |inputs: serde_json::Value| Dispatch {
             workflow: Some("release.yml".into()),
             inputs: inputs.as_object().unwrap().clone(),
@@ -965,6 +1001,49 @@ jobs:
     }
 
     #[tokio::test]
+    async fn polling_starts_a_run_for_each_new_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture_repo(dir.path(), &[(".moloko.yml", "jobs:\n  a:\n    steps: [echo hi]\n")]).await;
+        let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0", Default::default()).unwrap();
+        let pid = engine.db.create_project("demo").unwrap();
+        let rid = engine.db.create_repo(pid, "api", repo.to_str().unwrap(), true).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap().status.success();
+            assert!(ok, "git {args:?}");
+        };
+        let commit = |msg: &str| git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", msg]);
+
+        // The first poll only records where the branches are.
+        engine.poll_once().await;
+        assert!(engine.db.runs(None, None, 10).unwrap().is_empty());
+
+        commit("second");
+        engine.poll_once().await;
+        engine.poll_once().await;
+        let runs = engine.db.runs(None, None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].trigger.as_str(), runs[0].git_ref.as_str()), ("push", "refs/heads/main"));
+        assert_eq!(wait_done(&engine, runs[0].id).await, "success");
+
+        // A push no pipeline exists for leaves no run behind.
+        git(&["checkout", "-q", "-b", "empty"]);
+        git(&["rm", "-q", ".moloko.yml"]);
+        commit("no pipeline");
+        engine.poll_once().await;
+        for _ in 0..100 {
+            if engine.db.runs(None, None, 10).unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(engine.db.runs(None, None, 10).unwrap().len(), 1);
+
+        // Turning polling off and on again starts from a clean record.
+        assert!(engine.db.update_repo(rid, None, None, Some(true)).unwrap());
+        assert!(engine.db.repo_refs(rid).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn vault_secrets_reach_steps_masked() {
         use crate::secrets::Scope;
         let dir = tempfile::tempdir().unwrap();
@@ -972,8 +1051,11 @@ jobs:
         let repo = fixture_repo(dir.path(), &[(".moloko.yml", pipeline)]).await;
         let engine = Engine::new(&dir.path().join("data"), 2, "localhost:0", Default::default()).unwrap();
         let pid = engine.db.create_project("demo").unwrap();
-        let rid = engine.db.create_repo(pid, "api", repo.to_str().unwrap()).unwrap();
+        let rid = engine.db.create_repo(pid, "api", repo.to_str().unwrap(), false).unwrap();
         for (scope, name, value) in [
+            (Scope::Server, "TOKEN", "server-value"),
+            (Scope::Server, "SHARED", "from-server"),
+            (Scope::Server, "GLOBAL", "from-server"),
             (Scope::Project(pid), "TOKEN", "project-value"),
             (Scope::Project(pid), "SHARED", "from-project"),
             (Scope::Repo(rid), "TOKEN", "repo-s3cret"),
@@ -984,7 +1066,14 @@ jobs:
         let r = engine.db.repo(rid).unwrap().unwrap();
         let mut secrets = engine.secrets_for(&r).unwrap();
         secrets.sort();
-        assert_eq!(secrets, [("SHARED".into(), "from-project".into()), ("TOKEN".into(), "repo-s3cret".into())]);
+        assert_eq!(
+            secrets,
+            [
+                ("GLOBAL".into(), "from-server".into()),
+                ("SHARED".into(), "from-project".into()),
+                ("TOKEN".into(), "repo-s3cret".into())
+            ]
+        );
 
         let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         assert_eq!(wait_done(&engine, run).await, "failed");
@@ -1009,7 +1098,7 @@ jobs:
         let pid = engine.db.create_project("demo").unwrap();
         let rid = engine
             .db
-            .create_repo(pid, "api", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap(), false)
             .unwrap();
         let run = engine.trigger(rid, "main", None, None, "manual", Default::default()).unwrap();
         assert_eq!(wait_done(&engine, run).await, "failed");

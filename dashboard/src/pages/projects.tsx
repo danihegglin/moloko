@@ -113,7 +113,10 @@ function RepoRow({ repo, onChange, onRun }: { repo: Repo; onChange: () => void; 
   return (
     <li className="flex items-center gap-4 py-3">
       <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium">{repo.name}</div>
+        <div className="flex items-baseline gap-2 text-sm">
+          <span className="font-medium">{repo.name}</span>
+          {repo.poll && <span className="text-xs text-muted-foreground">builds on push</span>}
+        </div>
         <div className="truncate font-mono text-xs text-muted-foreground">{repo.url}</div>
       </div>
       <Button variant="outline" size="sm" onClick={onRun}>
@@ -176,14 +179,16 @@ function ProjectDialog({ open, onOpenChange, project, onDone }: { open: boolean;
 function RepoDialog({ open, onOpenChange, projectId, repo, onDone }: { open: boolean; onOpenChange: (open: boolean) => void; projectId: number; repo?: Repo; onDone: () => void }) {
   const [url, setUrl] = useState(repo?.url ?? '')
   const [name, setName] = useState(repo?.name ?? '')
+  const [poll, setPoll] = useState(repo?.poll ?? false)
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
-    const ok = await attempt(() => (repo ? api.updateRepo(repo.id, { name, url }) : api.createRepo(projectId, url, name)), repo ? 'Saved' : 'Repository added')
+    const ok = await attempt(() => (repo ? api.updateRepo(repo.id, { name, url, poll }) : api.createRepo(projectId, url, name, poll)), repo ? 'Saved' : 'Repository added')
     if (ok) {
       onOpenChange(false)
       if (!repo) {
         setUrl('')
         setName('')
+        setPoll(false)
       }
       onDone()
     }
@@ -205,6 +210,15 @@ function RepoDialog({ open, onOpenChange, projectId, repo, onDone }: { open: boo
             <Label htmlFor="repo-name">Name</Label>
             <Input id="repo-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="From the URL" required={!!repo} />
           </div>
+          <label htmlFor="repo-poll" className="flex items-start gap-3 text-sm">
+            <input id="repo-poll" type="checkbox" checked={poll} onChange={(e) => setPoll(e.target.checked)} className="mt-0.5 size-4 accent-foreground" />
+            <span>
+              <span className="font-medium">Build on push</span>
+              <span className="block text-xs text-muted-foreground">
+                Checks the repository for new commits every minute and runs the pipelines that listen for pushes. Starts with the next commit; nothing already there is built.
+              </span>
+            </span>
+          </label>
           <DialogFooter>
             <Button type="submit">{repo ? 'Save' : 'Add'}</Button>
           </DialogFooter>

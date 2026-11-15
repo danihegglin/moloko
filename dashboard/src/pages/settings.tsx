@@ -1,6 +1,7 @@
 import { api, type Download } from '@/api'
 import { usePoll } from '@/hooks'
 import { attempt, Muted, PageHeader } from '@/components/common'
+import { SecretsEditor, SecretsHelp } from '@/components/secrets'
 import { Button } from '@/components/ui/button'
 
 export function SettingsPage() {
@@ -8,6 +9,15 @@ export function SettingsPage() {
   return (
     <>
       <PageHeader title="Settings" />
+      <section className="mb-12">
+        <h2 className="font-semibold tracking-tight">Secrets</h2>
+        <p className="mt-1.5 mb-4 max-w-xl text-sm text-muted-foreground">
+          <SecretsHelp kind="server" />
+        </p>
+        <div className="grid max-w-xl gap-4">
+          <SecretsEditor scope="" />
+        </div>
+      </section>
       <section>
         <h2 className="font-semibold tracking-tight">Runner downloads</h2>
         <p className="mt-1.5 mb-4 max-w-xl text-sm text-muted-foreground">

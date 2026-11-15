@@ -59,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/repos/{id}", patch(update_repo).delete(delete_repo))
         .route("/api/repos/{id}/runs", post(trigger_run))
         .route("/api/repos/{id}/workflows", get(repo_workflows))
+        .route("/api/secrets", get(list_server_secrets))
+        .route("/api/secrets/{name}", put(put_server_secret).delete(delete_server_secret))
         .route("/api/projects/{id}/secrets", get(list_project_secrets))
         .route(
             "/api/projects/{id}/secrets/{name}",
@@ -173,6 +175,9 @@ struct NewRepo {
     /// Defaults to the last path segment of the URL.
     name: Option<String>,
     url: String,
+    /// Check the remote for new commits and build them.
+    #[serde(default)]
+    poll: bool,
 }
 
 /// `git@github.com:acme/api.git` -> `api`
@@ -200,7 +205,7 @@ async fn create_repo(
     let id = s
         .engine
         .db
-        .create_repo(project_id, &name, url)
+        .create_repo(project_id, &name, url, r.poll)
         .map_err(|e| bad_request(format!("{e:#}")))?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id }))))
 }
@@ -209,6 +214,7 @@ async fn create_repo(
 struct RepoPatch {
     name: Option<String>,
     url: Option<String>,
+    poll: Option<bool>,
 }
 
 async fn update_repo(
@@ -223,7 +229,8 @@ async fn update_repo(
     }
     let old = s.engine.db.repo(id)?.ok_or_else(not_found)?;
     let url = url.filter(|u| *u != old.url);
-    match s.engine.db.update_repo(id, name, url) {
+    let poll = p.poll.filter(|v| *v != old.poll);
+    match s.engine.db.update_repo(id, name, url, poll) {
         Ok(true) => {}
         Ok(false) => return Err(not_found()),
         Err(e) => return Err(ApiError(StatusCode::CONFLICT, format!("{e:#}"))),
@@ -331,6 +338,22 @@ fn delete_secret(s: &AppState, scope: crate::secrets::Scope, name: &str) -> ApiR
     }
 }
 
+async fn list_server_secrets(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
+    list_secrets(&s, crate::secrets::Scope::Server)
+}
+
+async fn put_server_secret(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(b): Json<SecretBody>,
+) -> ApiResult<impl IntoResponse> {
+    put_secret(&s, crate::secrets::Scope::Server, &name, &b.value)
+}
+
+async fn delete_server_secret(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<impl IntoResponse> {
+    delete_secret(&s, crate::secrets::Scope::Server, &name)
+}
+
 async fn list_project_secrets(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
     list_secrets(&s, project_scope(&s, id)?)
 }
@@ -396,22 +419,24 @@ async fn list_runs(
     State(s): State<AppState>,
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    #[derive(serde::Serialize)]
-    struct RunWithJobs {
-        #[serde(flatten)]
-        run: crate::db::Run,
-        jobs: Vec<crate::db::Job>,
-    }
     let runs = s
         .engine
         .db
         .runs(q.project_id, q.repo_id, q.limit.unwrap_or(50).clamp(1, 500))?;
-    let mut out = Vec::with_capacity(runs.len());
-    for run in runs {
-        let jobs = jobs_with_steps(&s, run.id)?;
-        out.push(RunWithJobs { run, jobs });
-    }
-    Ok(Json(out))
+    Ok(Json(with_jobs(&s, runs)?))
+}
+
+#[derive(serde::Serialize)]
+struct RunWithJobs {
+    #[serde(flatten)]
+    run: crate::db::Run,
+    jobs: Vec<crate::db::Job>,
+}
+
+fn with_jobs(s: &AppState, runs: Vec<crate::db::Run>) -> anyhow::Result<Vec<RunWithJobs>> {
+    runs.into_iter()
+        .map(|run| Ok(RunWithJobs { jobs: jobs_with_steps(s, run.id)?, run }))
+        .collect()
 }
 
 /// A run's jobs, each running one with the step it is on.
@@ -426,7 +451,9 @@ fn jobs_with_steps(s: &AppState, run_id: i64) -> anyhow::Result<Vec<crate::db::J
 async fn get_run(State(s): State<AppState>, Path(id): Path<i64>) -> ApiResult<impl IntoResponse> {
     let run = s.engine.db.run(id)?.ok_or_else(not_found)?;
     let jobs = jobs_with_steps(&s, id)?;
-    Ok(Json(json!({ "run": run, "jobs": jobs })))
+    // Every run the same trigger started (one per pipeline), this one included.
+    let group = with_jobs(&s, s.engine.db.run_group(run.group_id)?)?;
+    Ok(Json(json!({ "run": run, "jobs": jobs, "group": group })))
 }
 
 async fn cancel_run(
@@ -747,6 +774,10 @@ async fn github_webhook(
     let mut runs = Vec::new();
     for r in s.engine.db.repos()? {
         if urls.contains(&normalize_repo_url(&r.url)) {
+            // The poller may have found this push first.
+            if r.poll && !s.engine.db.note_ref(r.id, &ev.git_ref, &ev.after)? {
+                continue;
+            }
             runs.push(
                 s.engine
                     .trigger(

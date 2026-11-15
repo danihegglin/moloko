@@ -15,9 +15,10 @@ pub struct Vault {
     rng: SystemRandom,
 }
 
-/// Where a secret lives: a project (shared by its repos) or one repo.
+/// Where a secret lives: the server (shared by everything), a project (shared by its repos) or one repo.
 #[derive(Debug, Clone, Copy)]
 pub enum Scope {
+    Server,
     Project(i64),
     Repo(i64),
 }
@@ -25,6 +26,7 @@ pub enum Scope {
 impl Scope {
     pub fn key(self) -> String {
         match self {
+            Scope::Server => "s".into(),
             Scope::Project(id) => format!("p:{id}"),
             Scope::Repo(id) => format!("r:{id}"),
         }

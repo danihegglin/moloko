@@ -7,6 +7,8 @@ export interface Repo {
   name: string
   url: string
   created_at: number
+  /** moloko checks the remote for new commits and builds them. */
+  poll: boolean
 }
 
 export interface Project {
@@ -26,6 +28,8 @@ export interface Run {
   sha: string | null
   status: Status
   trigger: string
+  /** Runs started by the same trigger (one per pipeline) share this: the id of the first of them. */
+  group_id: number
   /** `.moloko.yml` or the GitHub workflow's name. */
   workflow: string | null
   error: string | null
@@ -65,6 +69,8 @@ export interface Job {
   /** The step a running job is on. */
   step: string | null
 }
+
+export type RunWithJobs = Run & { jobs: Job[] }
 
 export interface AgentRow {
   agent: { id: number; name: string; labels: string[]; created_at: number; last_seen: number | null }
@@ -107,26 +113,29 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return res.status === 202 || res.status === 204 ? (undefined as T) : res.json()
 }
 
+const secretsPath = (scope: string) => (scope ? `/api/${scope}/secrets` : '/api/secrets')
+
 export const api = {
   projects: () => request<Project[]>('GET', '/api/projects'),
   createProject: (name: string) => request<{ id: number }>('POST', '/api/projects', { name }),
   renameProject: (id: number, name: string) => request<void>('PATCH', `/api/projects/${id}`, { name }),
   deleteProject: (id: number) => request<void>('DELETE', `/api/projects/${id}`),
-  createRepo: (projectId: number, url: string, name?: string) =>
-    request<{ id: number }>('POST', `/api/projects/${projectId}/repos`, { url, name: name || undefined }),
-  updateRepo: (id: number, patch: { name?: string; url?: string }) => request<void>('PATCH', `/api/repos/${id}`, patch),
+  createRepo: (projectId: number, url: string, name: string, poll: boolean) =>
+    request<{ id: number }>('POST', `/api/projects/${projectId}/repos`, { url, name: name || undefined, poll }),
+  updateRepo: (id: number, patch: { name?: string; url?: string; poll?: boolean }) => request<void>('PATCH', `/api/repos/${id}`, patch),
   deleteRepo: (id: number) => request<void>('DELETE', `/api/repos/${id}`),
-  /** Write-only: lists names, never values. `scope` is `projects/<id>` or `repos/<id>`. */
-  secrets: (scope: string) => request<SecretInfo[]>('GET', `/api/${scope}/secrets`),
+  /** Write-only: lists names, never values. `scope` is `projects/<id>`, `repos/<id>`, or empty for the server. */
+  secrets: (scope: string) => request<SecretInfo[]>('GET', secretsPath(scope)),
   putSecret: (scope: string, name: string, value: string) =>
-    request<void>('PUT', `/api/${scope}/secrets/${encodeURIComponent(name)}`, { value }),
-  deleteSecret: (scope: string, name: string) => request<void>('DELETE', `/api/${scope}/secrets/${encodeURIComponent(name)}`),
+    request<void>('PUT', `${secretsPath(scope)}/${encodeURIComponent(name)}`, { value }),
+  deleteSecret: (scope: string, name: string) => request<void>('DELETE', `${secretsPath(scope)}/${encodeURIComponent(name)}`),
   /** `filter` is `p<id>` for a project or `r<id>` for a repo. */
   runs: (filter?: string) => {
     const q = filter?.startsWith('p') ? `?project_id=${filter.slice(1)}` : filter?.startsWith('r') ? `?repo_id=${filter.slice(1)}` : ''
-    return request<(Run & { jobs: Job[] })[]>('GET', `/api/runs${q}`)
+    return request<RunWithJobs[]>('GET', `/api/runs${q}`)
   },
-  run: (id: number) => request<{ run: Run; jobs: Job[] }>('GET', `/api/runs/${id}`),
+  /** `group` is every run the same trigger started, this one included, oldest first. */
+  run: (id: number) => request<{ run: Run; jobs: Job[]; group: RunWithJobs[] }>('GET', `/api/runs/${id}`),
   trigger: (repoId: number, ref: string, workflow?: string, inputs?: Record<string, string | boolean>) =>
     request<{ id: number }>('POST', `/api/repos/${repoId}/runs`, { ref, workflow, inputs }),
   /** Pipelines a manual run can start at `ref`, with their workflow_dispatch inputs. */
@@ -151,6 +160,24 @@ export function jobCounts(jobs: Job[]): string {
     .filter(([n]) => n > 0)
     .map(([n, label]) => `${n} ${label}`)
     .join(' · ')
+}
+
+/** One status for the runs of a trigger: in progress while any is, then the worst outcome. */
+export function groupStatus(runs: Run[]): Status {
+  const order: Status[] = ['running', 'queued', 'failed', 'cancelled', 'success']
+  return order.find((s) => runs.some((r) => r.status === s)) ?? 'success'
+}
+
+/** Start of the earliest and end of the latest run; the end is null while any is unfinished. */
+export function groupSpan(runs: Run[]): [number | null, number | null] {
+  const starts = runs.flatMap((r) => (r.started_at ? [r.started_at] : []))
+  const done = runs.every((r) => r.finished_at)
+  return [starts.length ? Math.min(...starts) : null, done ? Math.max(...runs.map((r) => r.finished_at!)) : null]
+}
+
+/** The run of a group to open first: one in progress, else a failed one, else the first. */
+export function groupFocus<T extends Run>(runs: T[]): T {
+  return runs.find((r) => r.status === 'running') ?? runs.find((r) => r.status === 'failed') ?? runs[0]
 }
 
 export const isActive = (s: Status) => s === 'queued' || s === 'running'

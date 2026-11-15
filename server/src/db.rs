@@ -52,6 +52,8 @@ pub struct Repo {
     pub name: String,
     pub url: String,
     pub created_at: i64,
+    /// Check the remote for new commits and start push runs for them.
+    pub poll: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +67,8 @@ pub struct Run {
     pub sha: Option<String>,
     pub status: String,
     pub trigger: String,
+    /// Runs started by the same trigger (one per pipeline) share this: the id of the first of them.
+    pub group_id: i64,
     /// `.moloko.yml` or the GitHub workflow's name.
     pub workflow: Option<String>,
     pub error: Option<String>,
@@ -149,6 +153,13 @@ CREATE TABLE IF NOT EXISTS runs (
     finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_repo ON runs(repo_id, id DESC);
+-- The remote's branches and tags as last seen, for repos that are polled.
+CREATE TABLE IF NOT EXISTS repo_refs (
+    repo_id INTEGER NOT NULL,
+    ref TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    PRIMARY KEY (repo_id, ref)
+);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -195,7 +206,7 @@ DROP TABLE runs_old;
 DROP TABLE projects_old;
 "#;
 
-const RUN_COLS: &str = "r.id, r.repo_id, g.name, g.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at, r.workflow";
+const RUN_COLS: &str = "r.id, r.repo_id, g.name, g.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at, r.workflow, COALESCE(r.group_id, r.id)";
 const RUN_FROM: &str =
     "runs r JOIN repos g ON g.id = r.repo_id JOIN projects p ON p.id = g.project_id";
 
@@ -215,10 +226,11 @@ fn map_run(r: &rusqlite::Row) -> rusqlite::Result<Run> {
         started_at: r.get(11)?,
         finished_at: r.get(12)?,
         workflow: r.get(13)?,
+        group_id: r.get(14)?,
     })
 }
 
-const REPO_COLS: &str = "g.id, g.project_id, p.name, g.name, g.url, g.created_at";
+const REPO_COLS: &str = "g.id, g.project_id, p.name, g.name, g.url, g.created_at, g.poll";
 
 fn map_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
     Ok(Repo {
@@ -228,6 +240,7 @@ fn map_repo(r: &rusqlite::Row) -> rusqlite::Result<Repo> {
         name: r.get(3)?,
         url: r.get(4)?,
         created_at: r.get(5)?,
+        poll: r.get(6)?,
     })
 }
 
@@ -254,6 +267,12 @@ impl Db {
         conn.execute_batch(TABLES)?;
         // Added after the first release; ignore the error when the column exists.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN workflow TEXT", []);
+        // Added after the first release; ignore the error when the column exists.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN group_id INTEGER", []);
+        // Added after the first release; ignore the errors when the columns exist.
+        // `polled_at` is NULL until the first poll has recorded the remote's refs.
+        let _ = conn.execute("ALTER TABLE repos ADD COLUMN poll INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE repos ADD COLUMN polled_at INTEGER", []);
         // Added after the first release; ignore the error when the column exists.
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN wg_public TEXT", []);
         // Anything still in flight belonged to a previous process.
@@ -324,6 +343,7 @@ impl Db {
             "DELETE FROM secrets WHERE scope = 'p:' || ?1 OR scope IN (SELECT 'r:' || id FROM repos WHERE project_id = ?1)",
             [id],
         )?;
+        tx.execute(&format!("DELETE FROM repo_refs WHERE repo_id IN {sub}"), [id])?;
         tx.execute("DELETE FROM repos WHERE project_id = ?1", [id])?;
         tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -357,11 +377,11 @@ impl Db {
             .exists([id])?)
     }
 
-    pub fn create_repo(&self, project_id: i64, name: &str, url: &str) -> Result<i64> {
+    pub fn create_repo(&self, project_id: i64, name: &str, url: &str, poll: bool) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO repos (project_id, name, url, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, name, url, now_ms()],
+            "INSERT INTO repos (project_id, name, url, created_at, poll) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, name, url, now_ms(), poll],
         )?;
         Ok(c.last_insert_rowid())
     }
@@ -388,16 +408,21 @@ impl Db {
     }
 
     /// Change a repo's name and/or URL. Changing the URL fails while a run of the repo is active.
-    pub fn update_repo(&self, id: i64, name: Option<&str>, url: Option<&str>) -> Result<bool> {
+    pub fn update_repo(&self, id: i64, name: Option<&str>, url: Option<&str>, poll: Option<bool>) -> Result<bool> {
         let mut c = self.conn();
         let tx = c.transaction()?;
         if url.is_some() && tx.prepare(&format!("{ACTIVE_RUN_OF_REPOS} (?1)"))?.exists([id])? {
             bail!("a run of this repo is still active; cancel it first");
         }
         let n = tx.execute(
-            "UPDATE repos SET name = COALESCE(?2, name), url = COALESCE(?3, url) WHERE id = ?1",
-            params![id, name, url],
+            "UPDATE repos SET name = COALESCE(?2, name), url = COALESCE(?3, url), poll = COALESCE(?4, poll) WHERE id = ?1",
+            params![id, name, url, poll],
         )?;
+        if url.is_some() || poll.is_some() {
+            // What was seen before no longer applies: the next poll only records the refs.
+            tx.execute("UPDATE repos SET polled_at = NULL WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM repo_refs WHERE repo_id = ?1", [id])?;
+        }
         tx.commit()?;
         Ok(n > 0)
     }
@@ -415,18 +440,29 @@ impl Db {
         )?;
         tx.execute("DELETE FROM runs WHERE repo_id = ?1", [id])?;
         tx.execute("DELETE FROM secrets WHERE scope = 'r:' || ?1", [id])?;
+        tx.execute("DELETE FROM repo_refs WHERE repo_id = ?1", [id])?;
         let n = tx.execute("DELETE FROM repos WHERE id = ?1", [id])?;
         tx.commit()?;
         Ok(n > 0)
     }
 
-    pub fn create_run(&self, repo_id: i64, git_ref: &str, trigger: &str) -> Result<i64> {
+    /// `group` is the first run of the same trigger; `None` starts a new group.
+    pub fn create_run(&self, repo_id: i64, git_ref: &str, trigger: &str, group: Option<i64>) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO runs (repo_id, git_ref, status, trigger, created_at) VALUES (?1, ?2, 'queued', ?3, ?4)",
-            params![repo_id, git_ref, trigger, now_ms()],
+            "INSERT INTO runs (repo_id, git_ref, status, trigger, created_at, group_id) VALUES (?1, ?2, 'queued', ?3, ?4, ?5)",
+            params![repo_id, git_ref, trigger, now_ms(), group],
         )?;
         Ok(c.last_insert_rowid())
+    }
+
+    /// The runs one trigger started, oldest first.
+    pub fn run_group(&self, group_id: i64) -> Result<Vec<Run>> {
+        let c = self.conn();
+        let sql = format!("SELECT {RUN_COLS} FROM {RUN_FROM} WHERE COALESCE(r.group_id, r.id) = ?1 ORDER BY r.id");
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map([group_id], map_run)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_run_workflow(&self, id: i64, workflow: &str) -> Result<()> {
@@ -480,6 +516,53 @@ impl Db {
         let c = self.conn();
         let sql = format!("SELECT {RUN_COLS} FROM {RUN_FROM} WHERE r.id = ?1");
         Ok(c.query_row(&sql, [id], map_run).optional()?)
+    }
+
+    /// Remove a run that turned out to have nothing to do.
+    pub fn delete_run(&self, id: i64) -> Result<()> {
+        let c = self.conn();
+        c.execute("DELETE FROM jobs WHERE run_id = ?1", [id])?;
+        c.execute("DELETE FROM runs WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The remote refs recorded by the last poll, or `None` before the first one.
+    pub fn repo_refs(&self, repo_id: i64) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let c = self.conn();
+        let polled: Option<i64> = c.query_row("SELECT polled_at FROM repos WHERE id = ?1", [repo_id], |r| r.get(0))?;
+        if polled.is_none() {
+            return Ok(None);
+        }
+        let mut st = c.prepare("SELECT ref, sha FROM repo_refs WHERE repo_id = ?1")?;
+        let rows = st.query_map([repo_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(Some(rows.collect::<rusqlite::Result<_>>()?))
+    }
+
+    /// Record what a poll saw, replacing the previous record.
+    pub fn set_repo_refs(&self, repo_id: i64, refs: &[(String, String)]) -> Result<()> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM repo_refs WHERE repo_id = ?1", [repo_id])?;
+        for (r, sha) in refs {
+            tx.execute("INSERT OR REPLACE INTO repo_refs (repo_id, ref, sha) VALUES (?1, ?2, ?3)", params![repo_id, r, sha])?;
+        }
+        tx.execute("UPDATE repos SET polled_at = ?2 WHERE id = ?1", params![repo_id, now_ms()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record that `git_ref` is at `sha`. Returns false when that was already known,
+    /// so a push reported by both a webhook and the poller starts only one run.
+    pub fn note_ref(&self, repo_id: i64, git_ref: &str, sha: &str) -> Result<bool> {
+        let c = self.conn();
+        let known: Option<String> = c
+            .query_row("SELECT sha FROM repo_refs WHERE repo_id = ?1 AND ref = ?2", params![repo_id, git_ref], |r| r.get(0))
+            .optional()?;
+        if known.as_deref() == Some(sha) {
+            return Ok(false);
+        }
+        c.execute("INSERT OR REPLACE INTO repo_refs (repo_id, ref, sha) VALUES (?1, ?2, ?3)", params![repo_id, git_ref, sha])?;
+        Ok(true)
     }
 
     pub fn create_job(&self, run_id: i64, name: &str, needs: &[String]) -> Result<i64> {
@@ -681,19 +764,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("moloko.db")).unwrap();
         let p = db.create_project("shop").unwrap();
-        let api = db.create_repo(p, "api", "https://x/api").unwrap();
-        let web = db.create_repo(p, "web", "https://x/web").unwrap();
-        assert!(db.create_repo(p, "api", "https://x/other").is_err());
-        let run = db.create_run(api, "main", "manual").unwrap();
+        let api = db.create_repo(p, "api", "https://x/api", false).unwrap();
+        let web = db.create_repo(p, "web", "https://x/web", false).unwrap();
+        assert!(db.create_repo(p, "api", "https://x/other", false).is_err());
+        let run = db.create_run(api, "main", "manual", None).unwrap();
         db.create_job(run, "build", &[]).unwrap();
 
-        assert!(db.update_repo(api, None, Some("git@x:api.git")).is_err());
-        assert!(db.update_repo(api, Some("backend"), None).unwrap());
+        assert!(db.update_repo(api, None, Some("git@x:api.git"), None).is_err());
+        assert!(db.update_repo(api, Some("backend"), None, None).unwrap());
         assert!(db.delete_repo(api).is_err());
         assert!(db.delete_project(p).is_err());
 
         db.finish_run(run, Status::Success, None).unwrap();
-        assert!(db.update_repo(api, None, Some("git@x:api.git")).unwrap());
+        assert!(db.update_repo(api, None, Some("git@x:api.git"), None).unwrap());
         assert_eq!(db.repo(api).unwrap().unwrap().url, "git@x:api.git");
         assert_eq!(db.repo(api).unwrap().unwrap().name, "backend");
         assert!(db.delete_repo(web).unwrap());

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDownIcon, ArrowLeftIcon } from 'lucide-react'
-import { api, duration, isActive, jobCounts, shortRef, type Job } from '@/api'
+import { api, duration, groupSpan, groupStatus, isActive, jobCounts, shortRef, type Job, type RunWithJobs } from '@/api'
 import { useNow, usePoll } from '@/hooks'
 import { cn } from '@/lib/utils'
 import { attempt, JobBar, Muted, StatusDot, StatusLabel } from '@/components/common'
 import { Button } from '@/components/ui/button'
 
 export function RunPage({ id, job }: { id: number; job?: number }) {
-  const { data, error } = usePoll(() => api.run(id), 1000, [id], (d) => isActive(d.run.status))
+  const { data, error } = usePoll(() => api.run(id), 1000, [id], (d) => d.group.some((r) => isActive(r.status)))
   // The selected job lives in the URL, so the runs list can link straight to one.
   const select = (jobId: number) => location.replace(`#/runs/${id}/${jobId}`)
   const now = useNow()
@@ -19,8 +19,13 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
 
   if (error && !data) return <p className="text-sm text-destructive">{error}</p>
   if (!data) return <Muted>Loading…</Muted>
-  const { run } = data
-  const meta = [run.workflow, shortRef(run.git_ref), run.sha?.slice(0, 7), run.trigger, duration(run.started_at, run.finished_at, now) || 'waiting'].filter(Boolean)
+  const { run, group } = data
+  // One trigger can start several pipelines. The header is about all of them; the rest about the one selected.
+  const many = group.length > 1
+  const status = groupStatus(group)
+  const [start, end] = groupSpan(group)
+  const meta = [many ? null : run.workflow, shortRef(run.git_ref), run.sha?.slice(0, 7), run.trigger, duration(start, end, now) || 'waiting'].filter(Boolean)
+  const active = group.filter((r) => isActive(r.status))
 
   return (
     <>
@@ -30,10 +35,10 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
       <div className="mb-10 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">
-            {run.project_name}/{run.repo_name} <span className="font-normal text-muted-foreground">#{run.id}</span>
+            {run.project_name}/{run.repo_name} <span className="font-normal text-muted-foreground">#{run.group_id}</span>
           </h1>
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-            <StatusLabel status={run.status} />
+            <StatusLabel status={status} />
             {meta.map((m, i) => (
               <span key={i} className="text-sm text-muted-foreground">
                 · {m}
@@ -41,12 +46,14 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
             ))}
           </div>
         </div>
-        {isActive(run.status) && (
-          <Button variant="outline" onClick={() => attempt(() => api.cancel(run.id), 'Cancelling')}>
-            Cancel
+        {active.length > 0 && (
+          <Button variant="outline" onClick={() => attempt(() => Promise.all(active.map((r) => api.cancel(r.id))), 'Cancelling')}>
+            {active.length > 1 ? 'Cancel all' : 'Cancel'}
           </Button>
         )}
       </div>
+
+      {many && <Pipelines group={group} selected={run.id} now={now} />}
 
       {run.error && <pre className="mb-8 overflow-x-auto rounded-md border border-destructive/40 p-4 font-mono text-xs whitespace-pre-wrap text-destructive">{run.error}</pre>}
       {jobs.length > 1 && (
@@ -59,6 +66,28 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
       {current && current.status === 'queued' && <Muted>{current.name} is waiting to start.</Muted>}
       {current && !['queued', 'skipped'].includes(current.status) && <LogView key={current.id} job={current} />}
     </>
+  )
+}
+
+/** The pipelines one trigger started; picking one shows its jobs and logs below. */
+function Pipelines({ group, selected, now }: { group: RunWithJobs[]; selected: number; now: number }) {
+  return (
+    <div className="mb-10 flex flex-wrap gap-1.5">
+      {group.map((r) => (
+        <a
+          key={r.id}
+          href={`#/runs/${r.id}`}
+          className={cn('flex w-56 items-center gap-2.5 rounded-md border px-3 py-2 text-sm transition-colors hover:border-foreground/40', r.id === selected && 'border-foreground')}
+        >
+          <StatusDot status={r.status} />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate font-medium">{r.workflow ?? r.repo_name}</span>
+            <span className="block truncate text-xs text-muted-foreground">{jobCounts(r.jobs) || (r.error ? 'did not start' : 'waiting')}</span>
+          </span>
+          <span className="font-mono text-xs text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now)}</span>
+        </a>
+      ))}
+    </div>
   )
 }
 

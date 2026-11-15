@@ -484,7 +484,7 @@ jobs:
         let pid = engine.db.create_project("demo").unwrap();
         let rid = engine
             .db
-            .create_repo(pid, "api", repo.to_str().unwrap())
+            .create_repo(pid, "api", repo.to_str().unwrap(), false)
             .unwrap();
         let token = new_token();
         engine

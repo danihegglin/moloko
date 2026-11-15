@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api, ago, duration, isActive, shortRef, type Job, type Run } from '@/api'
+import { api, ago, duration, groupFocus, groupSpan, groupStatus, isActive, shortRef, type Job, type RunWithJobs } from '@/api'
 import { useNow, usePoll } from '@/hooks'
 import { EmptyState, JobBar, Muted, PageHeader, StatusDot } from '@/components/common'
 import { TriggerDialog } from '@/components/trigger'
@@ -68,32 +68,8 @@ export function RunsPage() {
         </EmptyState>
       ) : (
         <ul className="divide-y border-y">
-          {runs.data.map((r) => (
-            <li key={r.id}>
-              <a href={`#/runs/${r.id}`} className="-mx-3 flex items-center gap-4 rounded-md px-3 py-3.5 transition-colors hover:bg-muted/60">
-                <StatusDot status={r.status} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2 truncate text-sm">
-                    <span className="font-medium">{r.workflow ?? r.repo_name}</span>
-                    <span className="truncate text-muted-foreground">
-                      {r.project_name}/{r.repo_name}
-                    </span>
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-2 truncate font-mono text-xs text-muted-foreground">
-                    <span>#{r.id}</span>
-                    <span>{shortRef(r.git_ref)}</span>
-                    {r.sha && <span>{r.sha.slice(0, 7)}</span>}
-                    <span className="hidden font-sans sm:inline">· {r.trigger}</span>
-                  </div>
-                </div>
-                {r.jobs.length > 1 && <JobBar jobs={r.jobs} className="hidden w-24 shrink-0 sm:flex" />}
-                <div className="w-16 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
-                  <div>{ago(r.created_at, now)}</div>
-                  <div className="mt-0.5">{duration(r.started_at, r.finished_at, now) || '—'}</div>
-                </div>
-              </a>
-              {isActive(r.status) && r.jobs.length > 0 && <ActiveJobs runId={r.id} jobs={r.jobs} now={now} />}
-            </li>
+          {grouped(runs.data).map((g) => (
+            <GroupRow key={g[0].group_id} runs={g} now={now} />
           ))}
         </ul>
       )}
@@ -101,10 +77,67 @@ export function RunsPage() {
   )
 }
 
-/** What a run in progress is doing right now: every job with the step it is on. */
-function ActiveJobs({ runId, jobs, now }: { runId: number; jobs: Job[]; now: number }) {
+/** Runs of the same trigger together, newest trigger first, each group oldest run first. */
+function grouped(runs: RunWithJobs[]): RunWithJobs[][] {
+  const groups = new Map<number, RunWithJobs[]>()
+  for (const r of runs) groups.set(r.group_id, [r, ...(groups.get(r.group_id) ?? [])])
+  return [...groups.values()]
+}
+
+/** One trigger: a single row, however many pipelines it started. */
+function GroupRow({ runs, now }: { runs: RunWithJobs[]; now: number }) {
+  const first = runs[0]
+  const status = groupStatus(runs)
+  const jobs = runs.flatMap((r) => r.jobs)
+  const [start, end] = groupSpan(runs)
   return (
-    <ul className="mb-3 ml-[3px] border-l pl-5">
+    <li>
+      <a href={`#/runs/${groupFocus(runs).id}`} className="-mx-3 flex items-center gap-4 rounded-md px-3 py-3.5 transition-colors hover:bg-muted/60">
+        <StatusDot status={status} />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline gap-2 text-sm">
+            <span className="truncate font-medium">{runs.map((r) => r.workflow ?? r.repo_name).join(', ')}</span>
+            <span className="shrink-0 text-muted-foreground">
+              {first.project_name}/{first.repo_name}
+            </span>
+          </div>
+          <div className="mt-0.5 flex items-center gap-2 truncate font-mono text-xs text-muted-foreground">
+            <span>#{first.group_id}</span>
+            <span>{shortRef(first.git_ref)}</span>
+            {first.sha && <span>{first.sha.slice(0, 7)}</span>}
+            <span className="hidden font-sans sm:inline">· {first.trigger}</span>
+          </div>
+        </div>
+        {jobs.length > 1 && <JobBar jobs={jobs} className="hidden w-24 shrink-0 sm:flex" />}
+        <div className="w-16 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
+          <div>{ago(first.created_at, now)}</div>
+          <div className="mt-0.5">{duration(start, end, now) || '—'}</div>
+        </div>
+      </a>
+      {isActive(status) && jobs.length > 0 && (
+        <div className="mb-3 ml-[3px] border-l pl-5">
+          {runs.map((r) => (
+            <div key={r.id}>
+              {runs.length > 1 && (
+                <a href={`#/runs/${r.id}`} className="-mx-2 flex items-center gap-3 rounded-md px-2 py-1 text-sm font-medium transition-colors hover:bg-muted/60">
+                  <StatusDot status={r.status} />
+                  <span className="min-w-0 flex-1 truncate">{r.workflow ?? r.repo_name}</span>
+                  <span className="shrink-0 font-mono text-xs font-normal text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now)}</span>
+                </a>
+              )}
+              {isActive(r.status) && <ActiveJobs runId={r.id} jobs={r.jobs} now={now} nested={runs.length > 1} />}
+            </div>
+          ))}
+        </div>
+      )}
+    </li>
+  )
+}
+
+/** What a run in progress is doing right now: every job with the step it is on. */
+function ActiveJobs({ runId, jobs, now, nested }: { runId: number; jobs: Job[]; now: number; nested: boolean }) {
+  return (
+    <ul className={nested ? 'mb-1 pl-5' : undefined}>
       {jobs
         .filter((j) => j.status !== 'skipped')
         .map((j) => (
@@ -121,11 +154,16 @@ function ActiveJobs({ runId, jobs, now }: { runId: number; jobs: Job[]; now: num
   )
 }
 
-function Summary({ runs }: { runs: (Run & { jobs: Job[] })[] }) {
-  const active = runs.filter((r) => isActive(r.status)).length
-  const done = runs.filter((r) => r.status === 'success' || r.status === 'failed')
-  const ok = done.filter((r) => r.status === 'success').length
+function Summary({ runs }: { runs: RunWithJobs[] }) {
+  const statuses = grouped(runs).map(groupStatus)
+  const active = statuses.filter(isActive).length
+  const done = statuses.filter((s) => s === 'success' || s === 'failed')
+  const ok = done.filter((s) => s === 'success').length
   const jobs = runs.flatMap((r) => r.jobs).filter((j) => j.status === 'running').length
-  const parts = [active ? `${active} ${active === 1 ? 'run' : 'runs'} in progress, ${jobs} ${jobs === 1 ? 'job' : 'jobs'} running` : null, done.length ? `${Math.round((ok / done.length) * 100)}% passing` : null, `${runs.length} recent`]
+  const parts = [
+    active ? `${active} ${active === 1 ? 'run' : 'runs'} in progress, ${jobs} ${jobs === 1 ? 'job' : 'jobs'} running` : null,
+    done.length ? `${Math.round((ok / done.length) * 100)}% passing` : null,
+    `${statuses.length} recent`,
+  ]
   return <>{parts.filter(Boolean).join(' · ')}</>
 }

@@ -29,6 +29,30 @@ async fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The remote's branches and tags as (full ref, commit sha), without fetching anything.
+pub async fn ls_remote(url: &str) -> Result<Vec<(String, String)>> {
+    let listing = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        git(&["ls-remote", "--heads", "--tags", url], None),
+    )
+    .await
+    .context("git ls-remote timed out")??;
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for line in listing.lines() {
+        let Some((sha, name)) = line.split_once('\t') else { continue };
+        // `refs/tags/v1^{}` is the commit an annotated tag points at; it follows the tag's own line.
+        match name.strip_suffix("^{}") {
+            Some(tag) => {
+                if let Some(e) = refs.iter_mut().find(|(n, _)| n == tag) {
+                    e.1 = sha.to_string();
+                }
+            }
+            None => refs.push((name.to_string(), sha.to_string())),
+        }
+    }
+    Ok(refs)
+}
+
 impl GitCache {
     pub fn new(root: &Path) -> Self {
         GitCache {

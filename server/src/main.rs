@@ -49,6 +49,9 @@ enum Command {
         /// Shared secret for GitHub webhooks. Webhooks are rejected when unset.
         #[arg(long, env = "MOLOKO_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
+        /// Seconds between checks for new commits in repositories with "Build on push" enabled; 0 disables polling.
+        #[arg(long, env = "MOLOKO_POLL_INTERVAL", default_value_t = 60)]
+        poll_interval: u64,
         /// Runner image for a GitHub workflow `runs-on` label, as label=image. Repeatable or comma-separated.
         #[arg(long = "gha-image", env = "MOLOKO_GHA_IMAGES", value_delimiter = ',')]
         gha_images: Vec<String>,
@@ -107,6 +110,7 @@ async fn main() -> Result<()> {
             wg_listen,
             wg_endpoint,
             gha_images,
+            poll_interval,
             github_token,
         } => {
             let executors = executors.unwrap_or_else(|| {
@@ -120,6 +124,17 @@ async fn main() -> Result<()> {
                 github_token: github_token.filter(|t| !t.is_empty()),
             };
             let engine = engine::Engine::new(&data, executors, &registry_host, gha_config)?;
+            if poll_interval > 0 {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(poll_interval));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        engine.poll_once().await;
+                    }
+                });
+            }
             let wg = if wg_listen == "off" {
                 None
             } else {

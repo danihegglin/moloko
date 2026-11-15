@@ -8,7 +8,7 @@ export type Route =
   | { page: 'images' }
   | { page: 'settings' }
 
-// Hash routes: #/ (runs), #/runs/:id, #/runs/:id/:job, #/projects, #/agents, #/images, #/settings
+// Hash routes: #/ (runs), #/runs/:id, #/runs/:id/:job, #/projects, #/images, #/deployments (also #/agents), #/settings
 export function useRoute(): Route {
   const [hash, setHash] = useState(location.hash)
   useEffect(() => {
@@ -19,7 +19,7 @@ export function useRoute(): Route {
   const m = hash.match(/^#\/runs\/(\d+)(?:\/(\d+))?/)
   if (m) return { page: 'run', id: Number(m[1]), job: m[2] ? Number(m[2]) : undefined }
   if (hash.startsWith('#/projects')) return { page: 'projects' }
-  if (hash.startsWith('#/agents')) return { page: 'agents' }
+  if (hash.startsWith('#/deployments') || hash.startsWith('#/agents')) return { page: 'agents' }
   if (hash.startsWith('#/images')) return { page: 'images' }
   if (hash.startsWith('#/settings')) return { page: 'settings' }
   return { page: 'runs' }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { XIcon } from 'lucide-react'
+import { KeyRoundIcon, XIcon } from 'lucide-react'
 import { api, ago, type SecretInfo } from '@/api'
 import { attempt } from '@/components/common'
 import { Button } from '@/components/ui/button'
@@ -50,23 +50,25 @@ export function SecretsEditor({ scope, active = true }: { scope: string; active?
   }
 
   return (
-    <>
+    <div className="grid gap-4">
       {list && list.length > 0 && (
-        <ul className="divide-y border-y">
+        <ul className="divide-y rounded-lg border">
           {list.map((s) => (
-            <li key={s.name} className="flex items-center gap-3 py-2">
+            <li key={s.name} className="flex items-center gap-3 py-2 pr-2 pl-3">
+              <KeyRoundIcon className="size-3.5 shrink-0 text-muted-foreground" />
               <code className="flex-1 truncate font-mono text-sm">{s.name}</code>
-              <span className="text-xs text-muted-foreground">{ago(s.updated_at)}</span>
-              <Button variant="ghost" size="icon-xs" className="text-muted-foreground" onClick={() => remove(s.name)} aria-label={`Delete ${s.name}`}>
+              <span className="text-xs text-muted-foreground">Updated {ago(s.updated_at)}</span>
+              <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-destructive" onClick={() => remove(s.name)} aria-label={`Delete ${s.name}`} title="Delete">
                 <XIcon />
               </Button>
             </li>
           ))}
         </ul>
       )}
-      {list && list.length === 0 && <p className="text-sm text-muted-foreground">No secrets yet.</p>}
+      {list && list.length === 0 && <p className="rounded-lg border border-dashed px-3 py-4 text-center text-sm text-muted-foreground">No secrets yet.</p>}
 
-      <form onSubmit={save} className="grid gap-4 border-t pt-4">
+      <form onSubmit={save} className="grid gap-4">
+        <div className="text-xs font-medium text-muted-foreground">Add or replace a secret</div>
         <div className="grid gap-2">
           <Label htmlFor={`secret-name-${scope}`}>Name</Label>
           <Input
@@ -96,7 +98,7 @@ export function SecretsEditor({ scope, active = true }: { scope: string; active?
           <Button type="submit">Save secret</Button>
         </div>
       </form>
-    </>
+    </div>
   )
 }
 

@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDownIcon, ArrowLeftIcon } from 'lucide-react'
-import { api, duration, groupSpan, groupStatus, isActive, jobCounts, shortRef, type Job, type RunWithJobs } from '@/api'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowDownIcon, ChevronRightIcon, TriangleAlertIcon } from 'lucide-react'
+import { api, duration, groupSpan, groupStatus, isActive, jobCounts, type Job, type RunWithJobs } from '@/api'
 import { useNow, usePoll } from '@/hooks'
 import { cn } from '@/lib/utils'
-import { attempt, JobBar, Muted, StatusDot, StatusLabel } from '@/components/common'
+import { attempt, Card, CopyButton, ErrorNote, JobBar, ListSkeleton, RefChip, Sha, StatusBadge, StatusIcon, Trigger } from '@/components/common'
 import { Button } from '@/components/ui/button'
 
 export function RunPage({ id, job }: { id: number; job?: number }) {
@@ -17,77 +17,159 @@ export function RunPage({ id, job }: { id: number; job?: number }) {
   const auto = jobs.find((j) => j.status === 'running') ?? jobs.find((j) => j.status === 'failed') ?? jobs[0]
   const current = jobs.find((j) => j.id === job) ?? auto
 
-  if (error && !data) return <p className="text-sm text-destructive">{error}</p>
-  if (!data) return <Muted>Loading…</Muted>
+  if (error && !data) return <ErrorNote>{error}</ErrorNote>
+  if (!data) return <ListSkeleton rows={3} />
   const { run, group } = data
   // One trigger can start several pipelines. The header is about all of them; the rest about the one selected.
   const many = group.length > 1
   const status = groupStatus(group)
   const [start, end] = groupSpan(group)
-  const meta = [many ? null : run.workflow, shortRef(run.git_ref), run.sha?.slice(0, 7), run.trigger, duration(start, end, now) || 'waiting'].filter(Boolean)
   const active = group.filter((r) => isActive(r.status))
+  const pipeline = run.workflow ?? run.repo_name
 
   return (
     <>
-      <a href="#/" className="mb-8 inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
-        <ArrowLeftIcon className="size-3.5" /> Runs
-      </a>
-      <div className="mb-10 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            {run.project_name}/{run.repo_name} <span className="font-normal text-muted-foreground">#{run.group_id}</span>
-          </h1>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-            <StatusLabel status={status} />
-            {meta.map((m, i) => (
-              <span key={i} className="text-sm text-muted-foreground">
-                · {m}
-              </span>
-            ))}
-          </div>
+      <nav className="mb-5 flex items-center gap-1.5 text-sm text-muted-foreground">
+        <a href="#/" className="transition-colors hover:text-foreground">
+          Runs
+        </a>
+        <ChevronRightIcon className="size-3.5 opacity-60" />
+        <span>
+          {run.project_name}/{run.repo_name}
+        </span>
+        <ChevronRightIcon className="size-3.5 opacity-60" />
+        <span className="font-mono text-foreground">#{run.group_id}</span>
+      </nav>
+      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="truncate text-2xl font-semibold tracking-tight">{many ? `${run.project_name}/${run.repo_name}` : pipeline}</h1>
+          <span className="font-mono text-xl text-muted-foreground">#{run.group_id}</span>
+          <StatusBadge status={status} />
         </div>
         {active.length > 0 && (
-          <Button variant="outline" onClick={() => attempt(() => Promise.all(active.map((r) => api.cancel(r.id))), 'Cancelling')}>
-            {active.length > 1 ? 'Cancel all' : 'Cancel'}
+          <Button variant="outline" className="self-start bg-card shadow-xs sm:self-auto" onClick={() => attempt(() => Promise.all(active.map((r) => api.cancel(r.id))), 'Cancelling')}>
+            {active.length > 1 ? 'Cancel all' : 'Cancel run'}
           </Button>
         )}
       </div>
 
+      <Card className="mb-8">
+        <dl className="grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-5">
+          <Fact label="Repository">
+            <span className="truncate">
+              {run.project_name}/{run.repo_name}
+            </span>
+          </Fact>
+          <Fact label="Ref">
+            <RefChip gitRef={run.git_ref} />
+          </Fact>
+          <Fact label="Commit">{run.sha ? <Sha sha={run.sha} className="text-sm text-foreground" /> : <span className="text-muted-foreground">Not resolved</span>}</Fact>
+          <Fact label="Started">
+            <span className="inline-flex items-center gap-2">
+              <span title={new Date(run.created_at).toLocaleString()}>{new Date(run.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+              <Trigger trigger={run.trigger} className="text-xs text-muted-foreground" />
+            </span>
+          </Fact>
+          <Fact label="Duration" className="col-span-2 sm:col-span-2 lg:col-span-1">
+            <span className="tabular-nums">{duration(start, end, now) || 'Waiting'}</span>
+          </Fact>
+        </dl>
+      </Card>
+
       {many && <Pipelines group={group} selected={run.id} now={now} />}
 
-      {run.error && <pre className="mb-8 overflow-x-auto rounded-md border border-destructive/40 p-4 font-mono text-xs whitespace-pre-wrap text-destructive">{run.error}</pre>}
-      {jobs.length > 1 && (
-        <div className="mb-6">
-          <JobBar jobs={jobs} />
-          <p className="mt-2 text-xs text-muted-foreground">{jobCounts(jobs)}</p>
+      {run.error && (
+        <div className="mb-8 flex gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-destructive">
+          <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
+          <div className="min-w-0">
+            <p className="text-sm font-medium">{many ? `${pipeline} did not start` : 'The run did not start'}</p>
+            <pre className="mt-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap">{run.error}</pre>
+          </div>
         </div>
       )}
-      {jobs.length > 0 && <JobGraph jobs={jobs} selected={current?.id} onSelect={select} now={now} />}
-      {current && current.status === 'queued' && <Muted>{current.name} is waiting to start.</Muted>}
-      {current && !['queued', 'skipped'].includes(current.status) && <LogView key={current.id} job={current} />}
+      {jobs.length > 0 && (
+        <section className="mb-8">
+          <SectionTitle title={many ? `Jobs in ${pipeline}` : 'Jobs'} aside={jobCounts(jobs)} />
+          <Card>
+            {jobs.length > 1 && <JobBar jobs={jobs} className="h-1 gap-0 [&>span]:rounded-none" />}
+            <div className="thin-scroll overflow-x-auto p-4">
+              <JobGraph jobs={jobs} selected={current?.id} onSelect={select} now={now} />
+            </div>
+          </Card>
+        </section>
+      )}
+      {current && current.status === 'queued' && (
+        <Notice status="queued" title={`${current.name} is waiting to start`}>
+          {current.needs.length > 0 ? `It runs after ${current.needs.join(', ')}.` : 'It starts as soon as an executor is free.'}
+        </Notice>
+      )}
+      {current && current.status === 'skipped' && (
+        <Notice status="skipped" title={`${current.name} was skipped`}>
+          Its condition was not met, or a job it needs did not pass.
+        </Notice>
+      )}
+      {current && !['queued', 'skipped'].includes(current.status) && <LogView key={current.id} job={current} now={now} />}
     </>
+  )
+}
+
+function Fact({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+  return (
+    <div className={cn('min-w-0 bg-card px-4 py-3', className)}>
+      <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
+      <dd className="mt-1.5 flex h-6 min-w-0 items-center text-sm">{children}</dd>
+    </div>
+  )
+}
+
+function SectionTitle({ title, aside }: { title: string; aside?: ReactNode }) {
+  return (
+    <div className="mb-3 flex items-baseline justify-between gap-4">
+      <h2 className="text-sm font-semibold">{title}</h2>
+      {aside && <span className="text-xs text-muted-foreground">{aside}</span>}
+    </div>
+  )
+}
+
+function Notice({ status, title, children }: { status: Job['status']; title: string; children: ReactNode }) {
+  return (
+    <Card className="flex items-start gap-3 p-4">
+      <StatusIcon status={status} className="mt-0.5" />
+      <div>
+        <p className="text-sm font-medium">{title}</p>
+        <p className="mt-0.5 text-sm text-muted-foreground">{children}</p>
+      </div>
+    </Card>
   )
 }
 
 /** The pipelines one trigger started; picking one shows its jobs and logs below. */
 function Pipelines({ group, selected, now }: { group: RunWithJobs[]; selected: number; now: number }) {
   return (
-    <div className="mb-10 flex flex-wrap gap-1.5">
-      {group.map((r) => (
-        <a
-          key={r.id}
-          href={`#/runs/${r.id}`}
-          className={cn('flex w-56 items-center gap-2.5 rounded-md border px-3 py-2 text-sm transition-colors hover:border-foreground/40', r.id === selected && 'border-foreground')}
-        >
-          <StatusDot status={r.status} />
-          <span className="min-w-0 flex-1">
-            <span className="block truncate font-medium">{r.workflow ?? r.repo_name}</span>
-            <span className="block truncate text-xs text-muted-foreground">{jobCounts(r.jobs) || (r.error ? 'did not start' : 'waiting')}</span>
-          </span>
-          <span className="font-mono text-xs text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now)}</span>
-        </a>
-      ))}
-    </div>
+    <section className="mb-8">
+      <SectionTitle title="Pipelines" aside={`${group.length} started by this ${group[0].trigger === 'manual' ? 'run' : group[0].trigger}`} />
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {group.map((r) => (
+          <a
+            key={r.id}
+            href={`#/runs/${r.id}`}
+            aria-current={r.id === selected ? 'true' : undefined}
+            className={cn(
+              'rounded-xl border bg-card p-3.5 shadow-xs transition-colors hover:border-foreground/30',
+              r.id === selected && 'border-foreground/70 ring-1 ring-foreground/70 hover:border-foreground/70',
+            )}
+          >
+            <div className="flex items-center gap-2.5 text-sm">
+              <StatusIcon status={r.status} />
+              <span className="min-w-0 flex-1 truncate font-medium">{r.workflow ?? r.repo_name}</span>
+              <span className="text-xs text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now)}</span>
+            </div>
+            <JobBar jobs={r.jobs} className="mt-3 h-1" />
+            <div className="mt-2 truncate text-xs text-muted-foreground">{jobCounts(r.jobs) || (r.error ? 'Did not start' : 'Waiting')}</div>
+          </a>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -115,43 +197,70 @@ function JobGraph({ jobs, selected, onSelect, now }: { jobs: Job[]; selected?: n
   }, [jobs])
 
   return (
-    <div className="mb-8 overflow-x-auto">
-      <div className="flex items-center gap-2">
-        {columns.map((col, i) => (
-          <div key={i} className="contents">
-            {i > 0 && <div className="h-px w-6 shrink-0 bg-border" />}
-            <div className="flex shrink-0 flex-col gap-1.5">
-              {col.map((j) => (
-                <button
-                  key={j.id}
-                  onClick={() => onSelect(j.id)}
-                  className={cn(
-                    'flex w-56 items-center gap-2.5 rounded-md border px-3 py-2 text-left text-sm transition-colors hover:border-foreground/40',
-                    (j.status === 'skipped' || j.status === 'cancelled') && 'text-muted-foreground',
-                    j.id === selected && 'border-foreground',
-                  )}
-                >
-                  <StatusDot status={j.status} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate">{j.name}</span>
-                    {j.step && <span className="block truncate text-xs text-muted-foreground">{j.step}</span>}
-                  </span>
-                  <span className="font-mono text-xs text-muted-foreground tabular-nums">{duration(j.started_at, j.finished_at, now)}</span>
-                </button>
-              ))}
+    <div className="flex items-center">
+      {columns.map((col, i) => (
+        <div key={i} className="contents">
+          {i > 0 && (
+            <div className="flex shrink-0 items-center text-muted-foreground/50">
+              <div className="h-px w-5 bg-current" />
+              <ChevronRightIcon className="-ml-2 size-4" />
             </div>
+          )}
+          <div className="flex shrink-0 flex-col gap-2">
+            {col.map((j) => (
+              <button
+                key={j.id}
+                onClick={() => onSelect(j.id)}
+                aria-pressed={j.id === selected}
+                className={cn(
+                  'flex h-[3.25rem] w-60 items-center gap-2.5 rounded-lg border bg-background px-3 text-left text-sm transition-colors hover:border-foreground/30',
+                  (j.status === 'skipped' || j.status === 'cancelled') && 'text-muted-foreground',
+                  j.id === selected && 'border-foreground/70 bg-card ring-1 ring-foreground/70 hover:border-foreground/70',
+                )}
+              >
+                <StatusIcon status={j.status} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium">{j.name}</span>
+                  {j.step && <span className="block truncate text-xs text-muted-foreground">{j.step.replace(/^▶ /, '')}</span>}
+                </span>
+                <span className="text-xs text-muted-foreground tabular-nums">{duration(j.started_at, j.finished_at, now)}</span>
+              </button>
+            ))}
           </div>
-        ))}
-      </div>
+        </div>
+      ))}
     </div>
   )
 }
 
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g
 
-function LogView({ job }: { job: Job }) {
+/** A `▶` line starts a step; the lines before the first one belong to no step. */
+interface Step {
+  title: string | null
+  /** Index of the step's first line in the whole log. */
+  at: number
+  lines: string[]
+  failed: boolean
+}
+
+function steps(lines: string[]): Step[] {
+  const out: Step[] = [{ title: null, at: 0, lines: [], failed: false }]
+  lines.forEach((l, i) => {
+    if (l.startsWith('▶')) out.push({ title: l.replace(/^▶ ?/, ''), at: i, lines: [], failed: false })
+    else {
+      const s = out[out.length - 1]
+      s.lines.push(l)
+      if (l.startsWith('✗')) s.failed = true
+    }
+  })
+  return out[0].lines.length ? out : out.slice(1)
+}
+
+function LogView({ job, now }: { job: Job; now: number }) {
   const [lines, setLines] = useState<string[]>([])
   const [follow, setFollow] = useState(true)
+  const [closed, setClosed] = useState<Set<number>>(new Set())
   const box = useRef<HTMLDivElement>(null)
   const buffer = useRef<string[]>([])
 
@@ -192,35 +301,82 @@ function LogView({ job }: { job: Job }) {
     if (el) setFollow(el.scrollHeight - el.scrollTop - el.clientHeight < 40)
   }, [])
 
+  const sections = useMemo(() => steps(lines), [lines])
+  const toggle = (at: number) =>
+    setClosed((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(at)) next.add(at)
+      return next
+    })
+
   return (
-    <div className="overflow-hidden rounded-md border">
-      <div className="flex items-center gap-3 border-b px-4 py-2.5 text-sm">
-        <StatusDot status={job.status} />
-        <span className="font-medium">{job.name}</span>
-        {job.exit_code != null && job.exit_code !== 0 && <span className="text-muted-foreground">exit {job.exit_code}</span>}
-        <span className="ml-auto font-mono text-xs text-muted-foreground tabular-nums">{lines.length} lines</span>
-        {!follow && (
-          <Button variant="ghost" size="xs" onClick={() => setFollow(true)}>
-            <ArrowDownIcon /> Follow
-          </Button>
-        )}
+    <Card>
+      <div className="flex h-12 items-center gap-3 border-b px-4 text-sm">
+        <StatusIcon status={job.status} />
+        <span className="truncate font-medium">{job.name}</span>
+        {job.exit_code != null && job.exit_code !== 0 && <span className="rounded-md border border-destructive/25 bg-destructive/10 px-1.5 py-0.5 font-mono text-xs text-destructive">exit {job.exit_code}</span>}
+        <span className="ml-auto hidden shrink-0 text-xs text-muted-foreground tabular-nums sm:inline">
+          {[duration(job.started_at, job.finished_at, now), `${lines.length} lines`].filter(Boolean).join(' · ')}
+        </span>
+        <div className="ml-auto flex items-center gap-1 sm:ml-0">
+          {!follow && (
+            <Button variant="outline" size="xs" onClick={() => setFollow(true)}>
+              <ArrowDownIcon /> Jump to end
+            </Button>
+          )}
+          <CopyButton value={() => lines.join('\n')} label="Copied the log" />
+        </div>
       </div>
-      <div ref={box} onScroll={onScroll} className="h-[62vh] overflow-auto bg-[#0a0a0a] py-3 font-mono text-[12.5px] leading-relaxed text-neutral-400">
-        {lines.map((l, i) => (
-          <div
-            key={i}
-            className={cn(
-              'flex px-4 break-all whitespace-pre-wrap hover:bg-white/[0.03]',
-              l.startsWith('▶') && 'mt-2 font-medium text-neutral-100',
-              l.startsWith('✗') && 'text-[#ff6166]',
-              (l.startsWith('●') || l.startsWith('◦')) && 'text-neutral-600',
-            )}
-          >
-            <span className="w-12 shrink-0 pr-4 text-right text-neutral-700 select-none">{i + 1}</span>
-            <span>{l}</span>
-          </div>
-        ))}
+      <div ref={box} onScroll={onScroll} className="thin-scroll h-[65vh] min-h-80 overflow-auto bg-[#0a0a0a] pb-3 font-mono text-[12.5px] leading-relaxed text-neutral-400">
+        {lines.length === 0 && <p className="px-4 pt-4 text-neutral-600">{isActive(job.status) ? 'Waiting for output…' : 'No output.'}</p>}
+        {sections.map((s, n) => {
+          const open = !closed.has(s.at) && s.lines.length > 0
+          const last = n === sections.length - 1
+          return (
+            <div key={s.at}>
+              {s.title != null && (
+                <button
+                  onClick={() => toggle(s.at)}
+                  aria-expanded={open}
+                  disabled={s.lines.length === 0}
+                  className="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-white/[0.06] bg-[#111] px-4 py-1.5 text-left text-neutral-100 enabled:hover:bg-[#161616]"
+                >
+                  <ChevronRightIcon className={cn('size-3.5 shrink-0 text-neutral-500 transition-transform', open && 'rotate-90', s.lines.length === 0 && 'invisible')} />
+                  <span
+                    className={cn(
+                      'size-1.5 shrink-0 rounded-full',
+                      s.failed ? 'bg-[#ff6166]' : last && job.status === 'running' ? 'animate-pulse bg-[#60a5fa]' : last && job.status !== 'success' ? 'bg-neutral-500' : 'bg-[#22c55e]',
+                    )}
+                  />
+                  <span className="min-w-0 flex-1 truncate font-medium">{s.title}</span>
+                  <span className="shrink-0 text-[11px] text-neutral-500 tabular-nums">
+                    {s.lines.length > 0 && `${s.lines.length} ${s.lines.length === 1 ? 'line' : 'lines'}`}
+                  </span>
+                </button>
+              )}
+              {open && (
+                <div className="py-1.5">
+                  {s.lines.map((l, i) => (
+                    <div
+                      key={i}
+                      className={cn(
+                        'flex px-4 break-all whitespace-pre-wrap hover:bg-white/[0.04]',
+                        l.startsWith('✗') && 'bg-[#ff6166]/10 text-[#ff6166]',
+                        /^(error|Error|ERROR)\b/.test(l) && 'text-[#ff8a8e]',
+                        /^(warning|Warning|WARN)\b/.test(l) && 'text-[#e5b567]',
+                        (l.startsWith('●') || l.startsWith('◦')) && 'text-neutral-600',
+                      )}
+                    >
+                      <span className="w-12 shrink-0 pr-4 text-right text-neutral-700 select-none">{s.at + i + (s.title == null ? 1 : 2)}</span>
+                      <span>{l}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })}
       </div>
-    </div>
+    </Card>
   )
 }

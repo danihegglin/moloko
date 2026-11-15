@@ -1,15 +1,22 @@
 import { useState } from 'react'
-import { api, ago, duration, groupFocus, groupSpan, groupStatus, isActive, shortRef, type Job, type RunWithJobs } from '@/api'
+import { ChevronRightIcon, InboxIcon, PlayIcon } from 'lucide-react'
+import { api, ago, duration, groupFocus, groupSpan, groupStatus, isActive, type Job, type RunWithJobs, type Status } from '@/api'
 import { useNow, usePoll } from '@/hooks'
-import { EmptyState, JobBar, Muted, PageHeader, StatusDot } from '@/components/common'
+import { cn } from '@/lib/utils'
+import { Card, EmptyState, ErrorNote, JobBar, ListSkeleton, Pill, RefChip, Sha, STATUS_LABEL, StatusIcon, Trigger } from '@/components/common'
 import { TriggerDialog } from '@/components/trigger'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from '@/components/ui/select'
 
 const ALL = 'all'
 
+type Tab = 'all' | 'active' | 'failed' | 'success'
+const TABS: [Tab, string][] = [['all', 'All'], ['active', 'In progress'], ['failed', 'Failed'], ['success', 'Passed']]
+const inTab = (tab: Tab, s: Status) => tab === 'all' || (tab === 'active' ? isActive(s) : s === tab)
+
 export function RunsPage() {
   const [filter, setFilter] = useState(ALL)
+  const [tab, setTab] = useState<Tab>('all')
   const [running, setRunning] = useState(false)
   const projects = usePoll(api.projects, 30000, [])
   const runs = usePoll(() => api.runs(filter === ALL ? undefined : filter), 2000, [filter])
@@ -18,12 +25,42 @@ export function RunsPage() {
   const filterRepo = filter.startsWith('r') ? Number(filter.slice(1)) : undefined
   const filterProject = filter.startsWith('p') ? Number(filter.slice(1)) : undefined
   const defaultRepo = filterRepo ?? repos.find((r) => r.project_id === filterProject)?.id ?? repos[0]?.id
+  const groups = runs.data ? grouped(runs.data) : []
+  const shown = groups.filter((g) => inTab(tab, groupStatus(g)))
 
   return (
     <>
-      <PageHeader title="Runs" description={runs.data && runs.data.length > 0 ? <Summary runs={runs.data} /> : undefined}>
+      <div className="mb-8 flex items-center gap-6">
+        <h1 className="text-2xl font-semibold tracking-tight">Runs</h1>
+        {repos.length > 0 && (
+          <Button className="ml-auto" onClick={() => setRunning(true)}>
+            <PlayIcon className="fill-current" /> New run
+          </Button>
+        )}
+      </div>
+      <TriggerDialog open={running} onOpenChange={setRunning} projects={projects.data ?? []} defaultRepo={defaultRepo} />
+
+      {runs.error && <ErrorNote>{runs.error}</ErrorNote>}
+
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-lg border bg-card p-0.5 shadow-xs">
+          {TABS.map(([t, label]) => {
+            const n = groups.filter((g) => inTab(t, groupStatus(g))).length
+            return (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                aria-pressed={tab === t}
+                className={cn('flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[13px] font-medium text-muted-foreground transition-colors hover:text-foreground', tab === t && 'bg-muted text-foreground')}
+              >
+                {label}
+                <span className="text-xs font-normal text-muted-foreground tabular-nums">{n}</span>
+              </button>
+            )
+          })}
+        </div>
         <Select value={filter} onValueChange={setFilter}>
-          <SelectTrigger className="w-48">
+          <SelectTrigger className="w-52 bg-card shadow-xs">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -42,15 +79,12 @@ export function RunsPage() {
             ))}
           </SelectContent>
         </Select>
-        {repos.length > 0 && <Button onClick={() => setRunning(true)}>New run</Button>}
-      </PageHeader>
-      <TriggerDialog open={running} onOpenChange={setRunning} projects={projects.data ?? []} defaultRepo={defaultRepo} />
+      </div>
 
-      {runs.error && <p className="mb-4 text-sm text-destructive">{runs.error}</p>}
       {!runs.data ? (
-        <Muted>Loading…</Muted>
-      ) : runs.data.length === 0 ? (
-        <EmptyState title="No runs yet">
+        <ListSkeleton rows={6} />
+      ) : groups.length === 0 ? (
+        <EmptyState icon={InboxIcon} title="No runs yet">
           {repos.length === 0 ? (
             <>
               Add a repository under{' '}
@@ -61,17 +95,31 @@ export function RunsPage() {
             </>
           ) : (
             <>
-              Commit a <code className="font-mono">.moloko.yml</code> or GitHub workflows, then start a run or point a GitHub webhook at{' '}
-              <code className="font-mono">/api/webhooks/github</code>.
+              Commit a <code className="font-mono">.moloko.yml</code> or GitHub workflows, then start a run, turn on <span className="text-foreground">Build on push</span> for the repository, or point a GitHub
+              webhook at <code className="font-mono">/api/webhooks/github</code>.
             </>
           )}
         </EmptyState>
+      ) : shown.length === 0 ? (
+        <EmptyState icon={InboxIcon} title={`No ${tab === 'active' ? 'runs in progress' : tab === 'failed' ? 'failed runs' : 'passed runs'}`}>
+          Nothing among the recent runs matches this filter.
+        </EmptyState>
       ) : (
-        <ul className="divide-y border-y">
-          {grouped(runs.data).map((g) => (
-            <GroupRow key={g[0].group_id} runs={g} now={now} />
-          ))}
-        </ul>
+        <Card>
+          <div className="hidden items-center gap-4 border-b bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground md:flex">
+            <span className="w-4" />
+            <span className="flex-1">Run</span>
+            <span className="w-60">Ref</span>
+            <span className="w-28">Jobs</span>
+            <span className="w-20 text-right">Duration</span>
+            <span className="w-4" />
+          </div>
+          <ul className="divide-y">
+            {shown.map((g) => (
+              <GroupRow key={g[0].group_id} runs={g} now={now} />
+            ))}
+          </ul>
+        </Card>
       )}
     </>
   )
@@ -89,40 +137,56 @@ function GroupRow({ runs, now }: { runs: RunWithJobs[]; now: number }) {
   const first = runs[0]
   const status = groupStatus(runs)
   const jobs = runs.flatMap((r) => r.jobs)
+  const done = jobs.filter((j) => !isActive(j.status)).length
   const [start, end] = groupSpan(runs)
   return (
     <li>
-      <a href={`#/runs/${groupFocus(runs).id}`} className="-mx-3 flex items-center gap-4 rounded-md px-3 py-3.5 transition-colors hover:bg-muted/60">
-        <StatusDot status={status} />
+      <a href={`#/runs/${groupFocus(runs).id}`} className="group flex items-center gap-4 px-4 py-3.5 transition-colors hover:bg-muted/50">
+        <StatusIcon status={status} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-baseline gap-2 text-sm">
+          <div className="flex items-center gap-2 text-sm">
             <span className="truncate font-medium">{runs.map((r) => r.workflow ?? r.repo_name).join(', ')}</span>
-            <span className="shrink-0 text-muted-foreground">
+            {runs.length > 1 && <Pill>{runs.length} pipelines</Pill>}
+          </div>
+          <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="truncate">
               {first.project_name}/{first.repo_name}
             </span>
-          </div>
-          <div className="mt-0.5 flex items-center gap-2 truncate font-mono text-xs text-muted-foreground">
-            <span>#{first.group_id}</span>
-            <span>{shortRef(first.git_ref)}</span>
-            {first.sha && <span>{first.sha.slice(0, 7)}</span>}
-            <span className="hidden font-sans sm:inline">· {first.trigger}</span>
+            <span className="text-muted-foreground/40">·</span>
+            <span className="font-mono">#{first.group_id}</span>
+            <span className="text-muted-foreground/40">·</span>
+            <Trigger trigger={first.trigger} />
           </div>
         </div>
-        {jobs.length > 1 && <JobBar jobs={jobs} className="hidden w-24 shrink-0 sm:flex" />}
-        <div className="w-16 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
-          <div>{ago(first.created_at, now)}</div>
-          <div className="mt-0.5">{duration(start, end, now) || '—'}</div>
+        <div className="hidden w-60 min-w-0 items-center gap-2.5 md:flex">
+          <RefChip gitRef={first.git_ref} className="max-w-36" />
+          {first.sha && <Sha sha={first.sha} />}
         </div>
+        <div className="hidden w-28 sm:block">
+          {jobs.length > 0 ? (
+            <>
+              <JobBar jobs={jobs} />
+              <div className="mt-1.5 text-[11px] text-muted-foreground tabular-nums">{isActive(status) ? `${done} of ${jobs.length} done` : `${jobs.length} ${jobs.length === 1 ? 'job' : 'jobs'}`}</div>
+            </>
+          ) : (
+            <span className="text-xs text-muted-foreground">{first.error ? 'Did not start' : '—'}</span>
+          )}
+        </div>
+        <div className="w-20 shrink-0 text-right text-xs tabular-nums">
+          <div className="font-medium">{duration(start, end, now) || '—'}</div>
+          <div className="mt-1 text-muted-foreground">{ago(first.created_at, now)}</div>
+        </div>
+        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/50 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
       </a>
       {isActive(status) && jobs.length > 0 && (
-        <div className="mb-3 ml-[3px] border-l pl-5">
+        <div className="border-t border-dashed bg-muted/30 py-2 pr-4 pl-12">
           {runs.map((r) => (
             <div key={r.id}>
               {runs.length > 1 && (
-                <a href={`#/runs/${r.id}`} className="-mx-2 flex items-center gap-3 rounded-md px-2 py-1 text-sm font-medium transition-colors hover:bg-muted/60">
-                  <StatusDot status={r.status} />
+                <a href={`#/runs/${r.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] font-medium transition-colors hover:bg-foreground/5">
+                  <StatusIcon status={r.status} className="size-3.5" />
                   <span className="min-w-0 flex-1 truncate">{r.workflow ?? r.repo_name}</span>
-                  <span className="shrink-0 font-mono text-xs font-normal text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now)}</span>
+                  <span className="shrink-0 text-xs font-normal text-muted-foreground tabular-nums">{duration(r.started_at, r.finished_at, now) || STATUS_LABEL[r.status].toLowerCase()}</span>
                 </a>
               )}
               {isActive(r.status) && <ActiveJobs runId={r.id} jobs={r.jobs} now={now} nested={runs.length > 1} />}
@@ -137,33 +201,19 @@ function GroupRow({ runs, now }: { runs: RunWithJobs[]; now: number }) {
 /** What a run in progress is doing right now: every job with the step it is on. */
 function ActiveJobs({ runId, jobs, now, nested }: { runId: number; jobs: Job[]; now: number; nested: boolean }) {
   return (
-    <ul className={nested ? 'mb-1 pl-5' : undefined}>
+    <ul className={nested ? 'mb-1 ml-[7px] border-l pl-4' : undefined}>
       {jobs
         .filter((j) => j.status !== 'skipped')
         .map((j) => (
           <li key={j.id}>
-            <a href={`#/runs/${runId}/${j.id}`} className="-mx-2 flex items-center gap-3 rounded-md px-2 py-1 text-sm transition-colors hover:bg-muted/60">
-              <StatusDot status={j.status} />
-              <span className={j.status === 'running' ? 'shrink-0' : 'shrink-0 text-muted-foreground'}>{j.name}</span>
-              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{j.status === 'queued' ? 'waiting' : j.step}</span>
-              <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{duration(j.started_at, j.finished_at, now)}</span>
+            <a href={`#/runs/${runId}/${j.id}`} className="-mx-2 flex items-center gap-2.5 rounded-md px-2 py-1.5 text-[13px] transition-colors hover:bg-foreground/5">
+              <StatusIcon status={j.status} className="size-3.5" />
+              <span className={cn('shrink-0', j.status !== 'running' && 'text-muted-foreground')}>{j.name}</span>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{j.status === 'queued' ? 'Waiting' : j.step?.replace(/^▶ /, '')}</span>
+              <span className="shrink-0 text-xs text-muted-foreground tabular-nums">{duration(j.started_at, j.finished_at, now)}</span>
             </a>
           </li>
         ))}
     </ul>
   )
-}
-
-function Summary({ runs }: { runs: RunWithJobs[] }) {
-  const statuses = grouped(runs).map(groupStatus)
-  const active = statuses.filter(isActive).length
-  const done = statuses.filter((s) => s === 'success' || s === 'failed')
-  const ok = done.filter((s) => s === 'success').length
-  const jobs = runs.flatMap((r) => r.jobs).filter((j) => j.status === 'running').length
-  const parts = [
-    active ? `${active} ${active === 1 ? 'run' : 'runs'} in progress, ${jobs} ${jobs === 1 ? 'job' : 'jobs'} running` : null,
-    done.length ? `${Math.round((ok / done.length) * 100)}% passing` : null,
-    `${statuses.length} recent`,
-  ]
-  return <>{parts.filter(Boolean).join(' · ')}</>
 }

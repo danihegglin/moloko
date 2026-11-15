@@ -1,9 +1,9 @@
 import { useState } from 'react'
-import { MoreHorizontalIcon } from 'lucide-react'
+import { MoreHorizontalIcon, PlusIcon, ServerIcon } from 'lucide-react'
 import { api, ago, type AgentRow, type AgentSecret } from '@/api'
 import { useNow, usePoll } from '@/hooks'
 import { cn } from '@/lib/utils'
-import { attempt, ConfirmDialog, CopyButton, EmptyState, Muted, PageHeader } from '@/components/common'
+import { attempt, Card, ConfirmDialog, CopyButton, EmptyState, ErrorNote, ListSkeleton, PageHeader, Pill } from '@/components/common'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
@@ -22,10 +22,12 @@ export function AgentsPage() {
   return (
     <>
       <PageHeader
-        title="Agents"
-        description={agents.data?.length ? `${online} of ${agents.data.length} connected.` : 'Deploy agents run on your servers and connect out to moloko.'}
+        title="Deployments"
+        description={agents.data?.length ? `Deploy agents run on your servers and connect out to moloko. ${online} of ${agents.data.length} connected.` : 'Deploy agents run on your servers and connect out to moloko.'}
       >
-        <Button onClick={() => setAdding(true)}>Add agent</Button>
+        <Button onClick={() => setAdding(true)}>
+          <PlusIcon /> Add agent
+        </Button>
       </PageHeader>
       <AddAgentDialog
         open={adding}
@@ -37,28 +39,30 @@ export function AgentsPage() {
       />
       {secret && <SecretDialog {...secret} onClose={() => setSecret(null)} />}
 
-      {agents.error && <p className="mb-4 text-sm text-destructive">{agents.error}</p>}
+      {agents.error && <ErrorNote>{agents.error}</ErrorNote>}
       {!agents.data ? (
-        <Muted>Loading…</Muted>
+        <ListSkeleton rows={3} />
       ) : agents.data.length === 0 ? (
-        <EmptyState title="No agents yet">
+        <EmptyState icon={ServerIcon} title="No agents yet" action={<Button onClick={() => setAdding(true)}>Add agent</Button>}>
           Add an agent, run the join command on a server, then target it from a pipeline with <code className="font-mono">agent: &lt;label&gt;</code>.
         </EmptyState>
       ) : (
-        <ul className="divide-y border-y">
-          {agents.data.map((row) => (
-            <AgentRowItem
-              key={row.agent.id}
-              row={row}
-              now={now}
-              onDeleted={refresh}
-              onRotated={(s) => {
-                setSecret({ name: row.agent.name, secret: s, rotated: true })
-                refresh()
-              }}
-            />
-          ))}
-        </ul>
+        <Card>
+          <ul className="divide-y">
+            {agents.data.map((row) => (
+              <AgentRowItem
+                key={row.agent.id}
+                row={row}
+                now={now}
+                onDeleted={refresh}
+                onRotated={(s) => {
+                  setSecret({ name: row.agent.name, secret: s, rotated: true })
+                  refresh()
+                }}
+              />
+            ))}
+          </ul>
+        </Card>
       )}
     </>
   )
@@ -69,17 +73,33 @@ function AgentRowItem({ row, now, onDeleted, onRotated }: { row: AgentRow; now: 
   const [dialog, setDialog] = useState<'rotate' | 'delete' | null>(null)
   const close = (open: boolean) => !open && setDialog(null)
   return (
-    <li className="flex items-center gap-4 py-3.5">
-      <span className={cn('size-2 shrink-0 rounded-full', online ? 'bg-foreground' : 'border border-muted-foreground')} title={online ? 'Connected' : 'Offline'} />
+    <li className="flex items-center gap-3 py-3 pr-3 pl-4">
+      <div className="relative grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/50">
+        <ServerIcon className="size-4 text-muted-foreground" />
+        <span className={cn('absolute -right-1 -bottom-1 size-2.5 rounded-full border-2 border-card', online ? 'bg-success' : 'bg-muted-foreground/50')} />
+      </div>
       <div className="min-w-0 flex-1">
-        <div className="flex items-baseline gap-2 text-sm">
-          <span className="font-medium">{agent.name}</span>
-          {agent.labels.length > 0 && <span className="truncate font-mono text-xs text-muted-foreground">{agent.labels.join(', ')}</span>}
+        <div className="flex items-center gap-2 text-sm">
+          <span className="truncate font-medium">{agent.name}</span>
+          {agent.labels.map((l) => (
+            <Pill key={l} className="font-mono">
+              {l}
+            </Pill>
+          ))}
         </div>
         <div className="mt-0.5 truncate text-xs text-muted-foreground">
-          {presence ? `${presence.hostname} · ${presence.os} · v${presence.version}` : agent.last_seen ? `Last seen ${ago(agent.last_seen, now)}` : 'Never connected'}
+          {presence ? `${presence.hostname} · ${presence.os} · v${presence.version}` : agent.last_seen ? `Last seen ${ago(agent.last_seen, now)}` : 'Waiting for the join command to be run'}
         </div>
       </div>
+      <span
+        className={cn(
+          'inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border px-2.5 text-xs font-medium',
+          online ? 'border-success/25 bg-success/10 text-success' : 'bg-muted text-muted-foreground',
+        )}
+      >
+        <span className="size-1.5 rounded-full bg-current" />
+        {online ? 'Connected' : agent.last_seen ? 'Offline' : 'Never connected'}
+      </span>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="ghost" size="icon-sm" className="text-muted-foreground" aria-label="More">

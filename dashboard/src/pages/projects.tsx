@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { MoreHorizontalIcon } from 'lucide-react'
-import { api, type Project, type Repo } from '@/api'
-import { usePoll } from '@/hooks'
-import { attempt, ConfirmDialog, EmptyState, Muted, PageHeader } from '@/components/common'
+import { FolderGit2Icon, FolderIcon, MoreHorizontalIcon, PlayIcon, PlusIcon, RefreshCwIcon } from 'lucide-react'
+import { api, ago, type Project, type Repo, type RunWithJobs } from '@/api'
+import { useNow, usePoll } from '@/hooks'
+import { attempt, Card, ConfirmDialog, EmptyState, ErrorNote, ListSkeleton, PageHeader, Pill, StatusIcon } from '@/components/common'
 import { TriggerDialog } from '@/components/trigger'
 import { SecretsDialog } from '@/components/secrets'
 import { Button } from '@/components/ui/button'
@@ -14,27 +14,36 @@ import { Label } from '@/components/ui/label'
 export function ProjectsPage() {
   const [version, setVersion] = useState(0)
   const projects = usePoll(api.projects, 30000, [version])
+  const runs = usePoll(() => api.runs(), 5000, [])
+  const now = useNow(10000)
   const refresh = () => setVersion((v) => v + 1)
   const [creating, setCreating] = useState(false)
   const [runRepo, setRunRepo] = useState<number | null>(null)
+  // The list is newest first, so the first run seen for a repository is its latest.
+  const latest = new Map<number, RunWithJobs>()
+  for (const r of runs.data ?? []) if (!latest.has(r.repo_id)) latest.set(r.repo_id, r)
 
   return (
     <>
       <PageHeader title="Projects" description="A project groups repositories. Each repository runs its own .moloko.yml and GitHub workflows.">
-        <Button onClick={() => setCreating(true)}>New project</Button>
+        <Button onClick={() => setCreating(true)}>
+          <PlusIcon /> New project
+        </Button>
       </PageHeader>
       <ProjectDialog open={creating} onOpenChange={setCreating} onDone={refresh} />
       <TriggerDialog open={runRepo != null} onOpenChange={(o) => !o && setRunRepo(null)} projects={projects.data ?? []} defaultRepo={runRepo ?? undefined} />
 
-      {projects.error && <p className="mb-4 text-sm text-destructive">{projects.error}</p>}
+      {projects.error && <ErrorNote>{projects.error}</ErrorNote>}
       {!projects.data ? (
-        <Muted>Loading…</Muted>
+        <ListSkeleton />
       ) : projects.data.length === 0 ? (
-        <EmptyState title="No projects yet">Create a project, then add its repositories.</EmptyState>
+        <EmptyState icon={FolderIcon} title="No projects yet" action={<Button onClick={() => setCreating(true)}>New project</Button>}>
+          Create a project, then add its repositories.
+        </EmptyState>
       ) : (
-        <div className="space-y-12">
+        <div className="space-y-6">
           {projects.data.map((p) => (
-            <ProjectSection key={p.id} project={p} onChange={refresh} onRun={setRunRepo} />
+            <ProjectSection key={p.id} project={p} latest={latest} now={now} onChange={refresh} onRun={setRunRepo} />
           ))}
         </div>
       )}
@@ -42,20 +51,21 @@ export function ProjectsPage() {
   )
 }
 
-function ProjectSection({ project, onChange, onRun }: { project: Project; onChange: () => void; onRun: (repo: number) => void }) {
+function ProjectSection({ project, latest, now, onChange, onRun }: { project: Project; latest: Map<number, RunWithJobs>; now: number; onChange: () => void; onRun: (repo: number) => void }) {
   const [dialog, setDialog] = useState<'rename' | 'delete' | 'repo' | 'secrets' | null>(null)
   const close = (open: boolean) => !open && setDialog(null)
   const n = project.repos.length
   return (
-    <section>
-      <div className="mb-3 flex items-center gap-3">
-        <h2 className="font-semibold tracking-tight">{project.name}</h2>
-        <span className="text-sm text-muted-foreground">
+    <Card>
+      <div className="flex items-center gap-3 border-b bg-muted/40 py-2.5 pr-3 pl-4">
+        <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
+        <h2 className="truncate text-sm font-semibold">{project.name}</h2>
+        <Pill>
           {n} {n === 1 ? 'repository' : 'repositories'}
-        </span>
+        </Pill>
         <div className="ml-auto flex items-center gap-1">
           <Button variant="ghost" size="sm" onClick={() => setDialog('repo')}>
-            Add repository
+            <PlusIcon /> Add repository
           </Button>
           <Menu>
             <DropdownMenuItem onSelect={() => setDialog('secrets')}>Secrets</DropdownMenuItem>
@@ -68,11 +78,11 @@ function ProjectSection({ project, onChange, onRun }: { project: Project; onChan
         </div>
       </div>
       {n === 0 ? (
-        <p className="rounded-md border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">No repositories yet.</p>
+        <p className="px-4 py-10 text-center text-sm text-muted-foreground">No repositories yet. Add one to start building.</p>
       ) : (
-        <ul className="divide-y border-y">
+        <ul className="divide-y">
           {project.repos.map((r) => (
-            <RepoRow key={r.id} repo={r} onChange={onChange} onRun={() => onRun(r.id)} />
+            <RepoRow key={r.id} repo={r} last={latest.get(r.id)} now={now} onChange={onChange} onRun={() => onRun(r.id)} />
           ))}
         </ul>
       )}
@@ -88,7 +98,7 @@ function ProjectSection({ project, onChange, onRun }: { project: Project; onChan
         action="Delete project"
         onConfirm={() => attempt(() => api.deleteProject(project.id), `Deleted ${project.name}`).then(onChange)}
       />
-    </section>
+    </Card>
   )
 }
 
@@ -107,20 +117,37 @@ function Menu({ children }: { children: React.ReactNode }) {
   )
 }
 
-function RepoRow({ repo, onChange, onRun }: { repo: Repo; onChange: () => void; onRun: () => void }) {
+function RepoRow({ repo, last, now, onChange, onRun }: { repo: Repo; last?: RunWithJobs; now: number; onChange: () => void; onRun: () => void }) {
   const [dialog, setDialog] = useState<'edit' | 'delete' | 'secrets' | null>(null)
   const close = (open: boolean) => !open && setDialog(null)
   return (
-    <li className="flex items-center gap-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-baseline gap-2 text-sm">
-          <span className="font-medium">{repo.name}</span>
-          {repo.poll && <span className="text-xs text-muted-foreground">builds on push</span>}
-        </div>
-        <div className="truncate font-mono text-xs text-muted-foreground">{repo.url}</div>
+    <li className="flex items-center gap-3 py-3 pr-3 pl-4">
+      <div className="grid size-9 shrink-0 place-items-center rounded-lg border bg-muted/50">
+        <FolderGit2Icon className="size-4 text-muted-foreground" />
       </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-sm">
+          <span className="truncate font-medium">{repo.name}</span>
+          {repo.poll && (
+            <Pill className="border-running/25 bg-running/10 text-running">
+              <RefreshCwIcon className="size-2.5" /> Builds on push
+            </Pill>
+          )}
+        </div>
+        <div className="mt-0.5 truncate font-mono text-xs text-muted-foreground">{repo.url}</div>
+      </div>
+      {last ? (
+        <a href={`#/runs/${last.id}`} className="hidden items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:flex" title="Latest run">
+          <StatusIcon status={last.status} className="size-3.5" />
+          <span className="max-w-32 truncate">{last.workflow ?? 'Run'}</span>
+          <span className="font-mono">#{last.group_id}</span>
+          <span>{ago(last.created_at, now)}</span>
+        </a>
+      ) : (
+        <span className="hidden px-2 text-xs text-muted-foreground md:block">No recent runs</span>
+      )}
       <Button variant="outline" size="sm" onClick={onRun}>
-        Run
+        <PlayIcon className="fill-current" /> Run
       </Button>
       <Menu>
         <DropdownMenuItem onSelect={() => setDialog('secrets')}>Secrets</DropdownMenuItem>
@@ -210,7 +237,7 @@ function RepoDialog({ open, onOpenChange, projectId, repo, onDone }: { open: boo
             <Label htmlFor="repo-name">Name</Label>
             <Input id="repo-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="From the URL" required={!!repo} />
           </div>
-          <label htmlFor="repo-poll" className="flex items-start gap-3 text-sm">
+          <label htmlFor="repo-poll" className="flex items-start gap-3 rounded-lg border bg-muted/30 p-3 text-sm">
             <input id="repo-poll" type="checkbox" checked={poll} onChange={(e) => setPoll(e.target.checked)} className="mt-0.5 size-4 accent-foreground" />
             <span>
               <span className="font-medium">Build on push</span>

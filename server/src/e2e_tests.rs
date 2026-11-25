@@ -198,7 +198,7 @@ async fn pull_mirror_follows_upstream_and_refuses_pushes() {
 async fn push_mirror_copies_changes_upstream() {
     let srv = Server::start().await;
     let (gh, _) = upstream(srv.dir.path(), "push");
-    let (_, p) = srv.api("POST", "/api/projects", Some(serde_json::json!({"name": "web"}))).await;
+    let (_, p) = srv.api("POST", "/api/projects", Some(serde_json::json!({"name": "site"}))).await;
     let pid = p["id"].as_i64().unwrap();
     let (st, repo) = srv
         .api("POST", &format!("/api/projects/{pid}/repos"), Some(serde_json::json!({"name": "web", "upstream_url": gh.to_str().unwrap()})))
@@ -210,7 +210,7 @@ async fn push_mirror_copies_changes_upstream() {
     eventually(|| remote_sha(&local, "refs/heads/main").is_some()).await;
 
     let work = srv.dir.path().join("w");
-    ok(srv.dir.path(), &["clone", "-q", &srv.url("web", "web"), work.to_str().unwrap()]);
+    ok(srv.dir.path(), &["clone", "-q", &srv.url("site", "web"), work.to_str().unwrap()]);
     let sha = commit(&work, "z", "1", "from moloko");
     ok(&work, &["push", "-q", "origin", "HEAD:main"]);
     eventually(|| remote_sha(&gh, "refs/heads/main").as_deref() == Some(sha.as_str())).await;

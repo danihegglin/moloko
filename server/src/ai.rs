@@ -312,15 +312,20 @@ async fn prepare_workspace(engine: &Arc<Engine>, session: i64, target: &Target, 
     if repos.is_empty() {
         bail!("the project has no repos");
     }
+    // The repo that already has the branch, else the first repo with any commits.
     let mut primary = None;
+    let mut first_with_commits = None;
     for r in &repos {
         let path = engine.git.ensure(r.id, &r.default_branch).await?;
         if Some(r.id) == primary_hint || (primary_hint.is_none() && engine.git.resolve(&path, &format!("refs/heads/{branch}")).await.is_ok()) {
             primary = Some(r.clone());
             break;
         }
+        if first_with_commits.is_none() && engine.git.resolve(&path, &r.default_branch).await.is_ok() {
+            first_with_commits = Some(r.clone());
+        }
     }
-    let primary = primary.unwrap_or_else(|| repos[0].clone());
+    let primary = primary.or(first_with_commits).unwrap_or_else(|| repos[0].clone());
     let dir = engine.work_dir.join(format!("ai-{session}"));
     tokio::fs::create_dir_all(&dir).await?;
     let mut checkouts = Vec::new();

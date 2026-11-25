@@ -218,7 +218,10 @@ async fn create_project(
         s.engine.db.set_project_key(id, key)?;
     }
     s.engine.db.set_member(id, actor.user.id, Role::Admin)?;
-    if let Some(repo) = s.engine.db.repos(id)?.into_iter().next() {
+    if url.is_empty() {
+        // A project without a GitHub URL starts with one empty hosted repo.
+        s.engine.db.create_repo(id, &crate::repos::slug(name), None, crate::repos::MirrorMode::None)?;
+    } else if let Some(repo) = s.engine.db.repos(id)?.into_iter().next() {
         let mode = p.mirror_mode.as_deref().and_then(crate::repos::MirrorMode::parse);
         s.engine.db.update_repo(repo.id, crate::repos::RepoSettings {
             mirror_mode: mode,

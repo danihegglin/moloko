@@ -12,6 +12,7 @@ base64 = "0.23.1"
 boringtun = "0.7.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+csv = "1.4.0"
 flate2 = "1.1.11"
 futures-util = "0.3.34"
 hex = "0.4.3"

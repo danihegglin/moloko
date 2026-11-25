@@ -28,6 +28,8 @@ pub struct Engine {
     pub git: GitCache,
     pub secrets: crate::crypto::Secrets,
     pub ai: crate::ai::AiHub,
+    /// Wakes the merge queue when a review is queued or a queue run ends.
+    pub queue_notify: tokio::sync::Notify,
     cache: Cache,
     pub work_dir: PathBuf,
     pub slots: Arc<Semaphore>,
@@ -46,6 +48,8 @@ pub struct RunCtx {
     pub sha: String,
     pub pipeline: Pipeline,
     pub cancel: CancellationToken,
+    /// Number of the open review for this branch, for preview deploys.
+    pub review: Option<i64>,
     /// Read-write registry credential, valid only while the run is active.
     registry_token: String,
 }
@@ -70,6 +74,7 @@ impl Engine {
             git: GitCache::new(&data_dir.join("repos")),
             secrets: crate::crypto::Secrets::load(data_dir)?,
             ai: crate::ai::AiHub::default(),
+            queue_notify: tokio::sync::Notify::new(),
             cache: Cache::new(&data_dir.join("cache")),
             work_dir,
             slots: Arc::new(Semaphore::new(executors.max(1))),
@@ -113,6 +118,25 @@ impl Engine {
             tracing::info!(run_id, status = status.as_str(), "run finished");
         });
         Ok(run_id)
+    }
+
+    /// Make a run cancellable from the API (used by AI agent sessions, which aren't pipelines).
+    pub fn register_cancel(&self, run_id: i64) -> CancellationToken {
+        let t = CancellationToken::new();
+        self.cancels.lock().unwrap().insert(run_id, t.clone());
+        t
+    }
+
+    pub fn unregister_cancel(&self, run_id: i64) {
+        self.cancels.lock().unwrap().remove(&run_id);
+    }
+
+    pub fn grant_registry(&self, token: &str) {
+        self.registry.grant_run_token(token);
+    }
+
+    pub fn revoke_registry(&self, token: &str) {
+        self.registry.revoke_run_token(token);
     }
 
     pub fn cancel(&self, run_id: i64) -> bool {
@@ -182,6 +206,7 @@ impl Engine {
             project_name: project.name.clone(),
             repo: repo.clone(),
             siblings,
+            review: crate::reviews::review_for_branch(&self.db, repo.id, &git_ref),
             git_ref,
             sha,
             pipeline,
@@ -548,6 +573,9 @@ fn job_env(
             ),
         ),
     ];
+    if let Some(n) = ctx.review {
+        env.push(("MOLOKO_REVIEW".into(), n.to_string()));
+    }
     env.extend(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
 }

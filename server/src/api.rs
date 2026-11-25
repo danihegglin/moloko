@@ -143,6 +143,12 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))

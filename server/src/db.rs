@@ -39,8 +39,11 @@ impl Status {
 pub struct Project {
     pub id: i64,
     pub name: String,
+    /// Upstream URL of the project's first repo, kept for older clients. Empty for hosted repos.
     pub repo_url: String,
     pub created_at: i64,
+    /// Issue key prefix, e.g. `MOL` for `MOL-42`.
+    pub key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +51,8 @@ pub struct Run {
     pub id: i64,
     pub project_id: i64,
     pub project_name: String,
+    pub repo_id: Option<i64>,
+    pub repo_name: Option<String>,
     pub git_ref: String,
     pub sha: Option<String>,
     pub status: String,
@@ -92,6 +97,30 @@ fn map_agent(r: &rusqlite::Row) -> rusqlite::Result<Agent> {
 
 pub struct Db(Mutex<Connection>);
 
+/// Projects from before multi-repo support get a repo for their URL, and a key.
+fn migrate_projects(c: &Connection) -> Result<()> {
+    let mut st = c.prepare(
+        "SELECT id, name, repo_url, key FROM projects p WHERE key = '' OR (repo_url != '' AND NOT EXISTS (SELECT 1 FROM repos WHERE project_id = p.id))",
+    )?;
+    let rows: Vec<(i64, String, String, String)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, name, url, key) in rows {
+        if key.is_empty() {
+            c.execute("UPDATE projects SET key = ?2 WHERE id = ?1", params![id, default_key(&name)])?;
+        }
+        let has_repo: bool = c.query_row("SELECT EXISTS (SELECT 1 FROM repos WHERE project_id = ?1)", [id], |r| r.get(0))?;
+        if !url.is_empty() && !has_repo {
+            c.execute(
+                "INSERT INTO repos (project_id, name, upstream_url, mirror_mode, created_at) VALUES (?1, ?2, ?3, 'pull', ?4)",
+                params![id, crate::repos::slug(&name), url, now_ms()],
+            )?;
+            c.execute("UPDATE runs SET repo_id = (SELECT id FROM repos WHERE project_id = ?1) WHERE project_id = ?1 AND repo_id IS NULL", [id])?;
+        }
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -135,7 +164,7 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 "#;
 
-const RUN_COLS: &str = "r.id, r.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at";
+const RUN_COLS: &str = "r.id, r.project_id, p.name, r.git_ref, r.sha, r.status, r.trigger, r.error, r.created_at, r.started_at, r.finished_at, r.repo_id, (SELECT name FROM repos WHERE id = r.repo_id)";
 
 fn map_run(r: &rusqlite::Row) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -150,7 +179,36 @@ fn map_run(r: &rusqlite::Row) -> rusqlite::Result<Run> {
         created_at: r.get(8)?,
         started_at: r.get(9)?,
         finished_at: r.get(10)?,
+        repo_id: r.get(11)?,
+        repo_name: r.get(12)?,
     })
+}
+
+const PROJECT_COLS: &str = "id, name, repo_url, created_at, key";
+
+fn map_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        repo_url: r.get(2)?,
+        created_at: r.get(3)?,
+        key: r.get(4)?,
+    })
+}
+
+/// `moloko-api` -> `MA`, `moloko` -> `MOL`: uppercase letters for issue keys.
+pub fn default_key(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let key: String = if words.len() > 1 {
+        words.iter().filter_map(|w| w.chars().next()).collect()
+    } else {
+        name.chars().filter(|c| c.is_ascii_alphabetic()).take(3).collect()
+    };
+    let key = key.to_ascii_uppercase();
+    if key.is_empty() { "PRJ".into() } else { key }
 }
 
 impl Db {
@@ -159,6 +217,18 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         // Added after the first release; ignore the error when the column exists.
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN wg_public TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN repo_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE projects ADD COLUMN key TEXT NOT NULL DEFAULT ''", []);
+        for schema in [
+            crate::auth::SCHEMA,
+            crate::repos::SCHEMA,
+            crate::issues::SCHEMA,
+            crate::reviews::SCHEMA,
+            crate::ai::SCHEMA,
+        ] {
+            conn.execute_batch(schema)?;
+        }
+        migrate_projects(&conn)?;
         // Anything still in flight belonged to a previous process.
         let now = now_ms();
         conn.execute(
@@ -172,58 +242,83 @@ impl Db {
         Ok(Db(Mutex::new(conn)))
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap()
     }
 
+    /// Create a project. With a `repo_url`, it also gets a first repo that pulls from that URL.
     pub fn create_project(&self, name: &str, repo_url: &str) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO projects (name, repo_url, created_at) VALUES (?1, ?2, ?3)",
-            params![name, repo_url, now_ms()],
+            "INSERT INTO projects (name, repo_url, created_at, key) VALUES (?1, ?2, ?3, ?4)",
+            params![name, repo_url, now_ms(), default_key(name)],
         )?;
-        Ok(c.last_insert_rowid())
+        let id = c.last_insert_rowid();
+        if !repo_url.is_empty() {
+            c.execute(
+                "INSERT INTO repos (project_id, name, upstream_url, mirror_mode, created_at) VALUES (?1, ?2, ?3, 'pull', ?4)",
+                params![id, crate::repos::slug(name), repo_url, now_ms()],
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub fn set_project_key(&self, id: i64, key: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE projects SET key = ?2 WHERE id = ?1", params![id, key])?;
+        Ok(())
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
         let c = self.conn();
-        let mut st =
-            c.prepare("SELECT id, name, repo_url, created_at FROM projects ORDER BY name")?;
-        let rows = st.query_map([], |r| {
-            Ok(Project {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                repo_url: r.get(2)?,
-                created_at: r.get(3)?,
-            })
-        })?;
+        let mut st = c.prepare(&format!("SELECT {PROJECT_COLS} FROM projects ORDER BY name"))?;
+        let rows = st.query_map([], map_project)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn project(&self, id: i64) -> Result<Option<Project>> {
         let c = self.conn();
         Ok(c.query_row(
-            "SELECT id, name, repo_url, created_at FROM projects WHERE id = ?1",
+            &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
             [id],
-            |r| {
-                Ok(Project {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    repo_url: r.get(2)?,
-                    created_at: r.get(3)?,
-                })
-            },
+            map_project,
         )
         .optional()?)
     }
 
-    pub fn create_run(&self, project_id: i64, git_ref: &str, trigger: &str) -> Result<i64> {
+    pub fn project_by_name(&self, name: &str) -> Result<Option<Project>> {
+        let c = self.conn();
+        Ok(c.query_row(
+            &format!("SELECT {PROJECT_COLS} FROM projects WHERE name = ?1 COLLATE NOCASE"),
+            [name],
+            map_project,
+        )
+        .optional()?)
+    }
+
+    pub fn create_run(
+        &self,
+        project_id: i64,
+        repo_id: i64,
+        git_ref: &str,
+        trigger: &str,
+    ) -> Result<i64> {
         let c = self.conn();
         c.execute(
-            "INSERT INTO runs (project_id, git_ref, status, trigger, created_at) VALUES (?1, ?2, 'queued', ?3, ?4)",
-            params![project_id, git_ref, trigger, now_ms()],
+            "INSERT INTO runs (project_id, repo_id, git_ref, status, trigger, created_at) VALUES (?1, ?2, ?3, 'queued', ?4, ?5)",
+            params![project_id, repo_id, git_ref, trigger, now_ms()],
         )?;
         Ok(c.last_insert_rowid())
+    }
+
+    /// Latest run of `repo_id` at `sha`, if any.
+    pub fn run_for_sha(&self, repo_id: i64, sha: &str) -> Result<Option<Run>> {
+        let c = self.conn();
+        let sql = format!(
+            "SELECT {RUN_COLS} FROM runs r JOIN projects p ON p.id = r.project_id
+             WHERE r.repo_id = ?1 AND r.sha = ?2 ORDER BY r.id DESC LIMIT 1"
+        );
+        Ok(c.query_row(&sql, params![repo_id, sha], map_run).optional()?)
     }
 
     pub fn start_run(&self, id: i64, sha: &str) -> Result<()> {
@@ -307,13 +402,14 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn job_exists(&self, id: i64) -> Result<bool> {
+    pub fn job_project(&self, id: i64) -> Result<Option<i64>> {
         let c = self.conn();
-        Ok(
-            c.query_row("SELECT 1 FROM jobs WHERE id = ?1", [id], |_| Ok(()))
-                .optional()?
-                .is_some(),
+        Ok(c.query_row(
+            "SELECT r.project_id FROM jobs j JOIN runs r ON r.id = j.run_id WHERE j.id = ?1",
+            [id],
+            |r| r.get(0),
         )
+        .optional()?)
     }
 
     pub fn create_agent(&self, name: &str, labels: &[String], token_hash: &str) -> Result<i64> {

@@ -1,5 +1,5 @@
-//! Local git mirror per project. Jobs check out via `git worktree`, so a checkout
-//! costs a few file writes instead of a network clone.
+//! Bare git repositories, one per moloko repo: hosted, or mirrored from upstream.
+//! Jobs check out via `git worktree`, so a checkout costs a few file writes instead of a clone.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -7,26 +7,79 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 
-pub struct GitCache {
-    root: PathBuf,
-    locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+pub const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+pub fn is_zero(sha: &str) -> bool {
+    sha.bytes().all(|b| b == b'0')
 }
 
-async fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(d) = cwd {
-        cmd.current_dir(d);
-    }
-    let out = cmd.output().await.context("failed to run git")?;
+pub(crate) async fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    git_env(args, cwd, &[]).await
+}
+
+/// Run git with extra environment variables (e.g. credentials passed as `GIT_CONFIG_*`,
+/// which unlike command-line arguments don't show up in `ps`).
+pub(crate) async fn git_env(
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+) -> Result<String> {
+    let out = git_output(args, cwd, env, None).await?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
-            args.join(" "),
+            args.first().unwrap_or(&""),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Run git and return its raw output, whatever the exit status. `stdin` is written then closed.
+pub(crate) async fn git_output(
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    stdin: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    let mut child = cmd.spawn().context("failed to run git")?;
+    if let Some(input) = stdin {
+        let mut w = child.stdin.take().unwrap();
+        w.write_all(input).await?;
+        drop(w);
+    }
+    Ok(child.wait_with_output().await?)
+}
+
+/// Commit identity for commits moloko writes itself (merges, AI agent changes).
+pub fn identity_env(name: &str, email: &str) -> Vec<(String, String)> {
+    vec![
+        ("GIT_AUTHOR_NAME".into(), name.into()),
+        ("GIT_AUTHOR_EMAIL".into(), email.into()),
+        ("GIT_COMMITTER_NAME".into(), name.into()),
+        ("GIT_COMMITTER_EMAIL".into(), email.into()),
+    ]
+}
+
+/// Bare repositories, one per moloko repo. Jobs check out via `git worktree`.
+pub struct GitCache {
+    root: PathBuf,
+    locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl GitCache {
@@ -37,61 +90,96 @@ impl GitCache {
         }
     }
 
-    fn lock(&self, project_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    /// Serialises worktree and ref changes per repo.
+    pub fn lock(&self, repo_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
             .unwrap()
-            .entry(project_id)
+            .entry(repo_id)
             .or_default()
             .clone()
     }
 
-    pub fn mirror_path(&self, project_id: i64) -> PathBuf {
-        self.root.join(format!("{project_id}.git"))
+    pub fn path(&self, repo_id: i64) -> PathBuf {
+        self.root.join(format!("{repo_id}.git"))
     }
 
-    /// Clone the mirror on first use, otherwise fetch only what changed.
-    pub async fn sync(&self, project_id: i64, url: &str) -> Result<PathBuf> {
-        let lock = self.lock(project_id);
-        let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
-        if mirror.join("HEAD").exists() {
-            git(&["fetch", "--prune", "--quiet", "origin"], Some(&mirror)).await?;
-        } else {
-            let tmp = self.root.join(format!("{project_id}.git.tmp"));
+    /// Create the bare repo on first use.
+    pub async fn ensure(&self, repo_id: i64, default_branch: &str) -> Result<PathBuf> {
+        let path = self.path(repo_id);
+        if !path.join("HEAD").exists() {
+            let tmp = self.root.join(format!("{repo_id}.git.tmp"));
             let _ = tokio::fs::remove_dir_all(&tmp).await;
             git(
-                &["clone", "--mirror", "--quiet", url, tmp.to_str().unwrap()],
+                &[
+                    "init",
+                    "--bare",
+                    "--quiet",
+                    &format!("--initial-branch={default_branch}"),
+                    tmp.to_str().unwrap(),
+                ],
                 None,
             )
             .await?;
-            tokio::fs::rename(&tmp, &mirror).await?;
+            // Unreachable objects from rejected pushes are cleaned up by gc after two weeks.
+            git(&["config", "gc.auto", "0"], Some(&tmp)).await?;
+            tokio::fs::rename(&tmp, &path).await?;
         }
-        Ok(mirror)
+        Ok(path)
     }
 
-    pub async fn resolve(&self, mirror: &Path, git_ref: &str) -> Result<String> {
+    pub async fn resolve(&self, repo: &Path, git_ref: &str) -> Result<String> {
         for candidate in [
             git_ref.to_string(),
             format!("refs/heads/{git_ref}"),
             format!("refs/tags/{git_ref}"),
         ] {
             let spec = format!("{candidate}^{{commit}}");
-            if let Ok(sha) = git(&["rev-parse", "--verify", "--quiet", &spec], Some(mirror)).await {
+            if let Ok(sha) = git(&["rev-parse", "--verify", "--quiet", &spec], Some(repo)).await {
                 return Ok(sha);
             }
         }
         bail!("ref {git_ref:?} not found")
     }
 
-    pub async fn read_file(&self, mirror: &Path, sha: &str, path: &str) -> Result<String> {
-        git(&["show", &format!("{sha}:{path}")], Some(mirror)).await
+    pub async fn read_file(&self, repo: &Path, sha: &str, path: &str) -> Result<String> {
+        git(&["show", &format!("{sha}:{path}")], Some(repo)).await
     }
 
-    pub async fn checkout(&self, project_id: i64, sha: &str, dest: &Path) -> Result<()> {
-        let lock = self.lock(project_id);
+    /// Branch and tag refs with their commit shas.
+    pub async fn refs(&self, repo: &Path) -> Result<HashMap<String, String>> {
+        let out = git(
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags",
+            ],
+            Some(repo),
+        )
+        .await?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(r, s)| (r.to_string(), s.to_string()))
+            .collect())
+    }
+
+    pub async fn is_ancestor(&self, repo: &Path, ancestor: &str, of: &str) -> bool {
+        git_output(
+            &["merge-base", "--is-ancestor", ancestor, of],
+            Some(repo),
+            &[],
+            None,
+        )
+        .await
+        .is_ok_and(|o| o.status.success())
+    }
+
+    pub async fn checkout(&self, repo_id: i64, sha: &str, dest: &Path) -> Result<()> {
+        let lock = self.lock(repo_id);
         let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
+        let repo = self.path(repo_id);
         git(
             &[
                 "worktree",
@@ -101,25 +189,25 @@ impl GitCache {
                 dest.to_str().unwrap(),
                 sha,
             ],
-            Some(&mirror),
+            Some(&repo),
         )
         .await?;
         Ok(())
     }
 
-    pub async fn remove(&self, project_id: i64, dest: &Path) {
-        let lock = self.lock(project_id);
+    pub async fn remove(&self, repo_id: i64, dest: &Path) {
+        let lock = self.lock(repo_id);
         let _g = lock.lock().await;
-        let mirror = self.mirror_path(project_id);
+        let repo = self.path(repo_id);
         if git(
             &["worktree", "remove", "--force", dest.to_str().unwrap()],
-            Some(&mirror),
+            Some(&repo),
         )
         .await
         .is_err()
         {
             let _ = tokio::fs::remove_dir_all(dest).await;
-            let _ = git(&["worktree", "prune"], Some(&mirror)).await;
+            let _ = git(&["worktree", "prune"], Some(&repo)).await;
         }
     }
 }
@@ -165,9 +253,11 @@ pub(crate) mod tests {
         let repo = fixture_repo(dir.path(), &[("a.txt", "hello")]).await;
         let cache = GitCache::new(&dir.path().join("mirrors"));
         std::fs::create_dir_all(dir.path().join("mirrors")).unwrap();
-        let mirror = cache.sync(1, repo.to_str().unwrap()).await.unwrap();
-        cache.sync(1, repo.to_str().unwrap()).await.unwrap(); // second sync fetches
+        let mirror = cache.ensure(1, "main").await.unwrap();
+        git(&["fetch", "--quiet", repo.to_str().unwrap(), "+refs/heads/*:refs/heads/*"], Some(&mirror)).await.unwrap();
         let sha = cache.resolve(&mirror, "main").await.unwrap();
+        assert_eq!(cache.refs(&mirror).await.unwrap()["refs/heads/main"], sha);
+        assert!(cache.is_ancestor(&mirror, &sha, &sha).await);
         assert_eq!(
             cache.read_file(&mirror, &sha, "a.txt").await.unwrap(),
             "hello"

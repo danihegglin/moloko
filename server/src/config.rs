@@ -11,6 +11,72 @@ const MAX_SHARDS: u32 = 256;
 #[serde(deny_unknown_fields)]
 pub struct Pipeline {
     pub jobs: BTreeMap<String, JobSpec>,
+    /// Other repos of the project to check out next to this one (at `../<repo>`).
+    #[serde(default)]
+    pub checkout: Vec<CheckoutSpec>,
+    /// Start this pipeline when another repo's default branch passes.
+    #[serde(default)]
+    pub on: Triggers,
+    /// Rules for reviews targeting this repo, read from the target branch.
+    #[serde(default)]
+    pub review: ReviewRules,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutSpec {
+    pub repo: String,
+    /// A branch, tag or sha, or `same-branch` (the default): the run's branch if the repo has it,
+    /// else its default branch.
+    #[serde(rename = "ref", default = "same_branch")]
+    pub git_ref: String,
+}
+
+fn same_branch() -> String {
+    "same-branch".into()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Triggers {
+    /// Repo names: run when their default branch has a successful run.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub upstream: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReviewRules {
+    pub required_approvals: u32,
+    /// Jobs that must pass on the review's head. Empty means every job of the run.
+    pub required_jobs: Vec<String>,
+    /// Require an approval from a code owner (`.moloko/CODEOWNERS`) of each changed file.
+    pub code_owners: bool,
+    /// `merge`, `squash` or `rebase`.
+    pub merge: String,
+    /// Test the merge result on top of the latest target before it lands.
+    pub merge_queue: bool,
+    /// `off`, `advisory` or `required`: the name of an AI agent that reviews, or off.
+    pub ai_review: String,
+    /// The AI agent that reviews when `ai_review` is not `off`.
+    pub ai_reviewer: Option<String>,
+    /// Changes authored by AI agents need an approval from a person.
+    pub human_approval_for_ai_changes: bool,
+}
+
+impl Default for ReviewRules {
+    fn default() -> Self {
+        ReviewRules {
+            required_approvals: 1,
+            required_jobs: vec![],
+            code_owners: false,
+            merge: "merge".into(),
+            merge_queue: false,
+            ai_review: "off".into(),
+            ai_reviewer: None,
+            human_approval_for_ai_changes: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +167,17 @@ impl Pipeline {
     fn validate(&self) -> Result<()> {
         if self.jobs.is_empty() {
             bail!("pipeline has no jobs");
+        }
+        if !["merge", "squash", "rebase"].contains(&self.review.merge.as_str()) {
+            bail!("review.merge must be merge, squash or rebase");
+        }
+        if !["off", "advisory", "required"].contains(&self.review.ai_review.as_str()) {
+            bail!("review.ai_review must be off, advisory or required");
+        }
+        for c in &self.checkout {
+            if !crate::repos::valid_repo_name(&c.repo) {
+                bail!("checkout: bad repo name {:?}", c.repo);
+            }
         }
         for (name, job) in &self.jobs {
             if name.is_empty()
@@ -257,5 +334,13 @@ jobs:
         assert_eq!(agent.jobs["b"].agent, vec!["prod", "eu"]);
         let empty = "jobs:\n  a: {steps: []}\n";
         assert!(Pipeline::parse(empty).is_err());
+        let multi = Pipeline::parse(
+            "checkout: [{repo: web}]\non: {upstream: api}\nreview: {required_approvals: 2, merge: squash}\njobs:\n  a: {steps: [x]}\n",
+        )
+        .unwrap();
+        assert_eq!(multi.checkout[0].git_ref, "same-branch");
+        assert_eq!(multi.on.upstream, vec!["api"]);
+        assert_eq!(multi.review.required_approvals, 2);
+        assert!(Pipeline::parse("review: {merge: octopus}\njobs:\n  a: {steps: [x]}\n").is_err());
     }
 }

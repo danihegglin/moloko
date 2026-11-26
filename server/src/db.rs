@@ -73,6 +73,8 @@ pub struct Job {
     pub exit_code: Option<i32>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Set for jobs that ran on a cloud runner: size, lease and attestation.
+    pub runner: Option<crate::runners::RunnerInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +221,7 @@ impl Db {
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN wg_public TEXT", []);
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN repo_id INTEGER", []);
         let _ = conn.execute("ALTER TABLE projects ADD COLUMN key TEXT NOT NULL DEFAULT ''", []);
+        let _ = conn.execute("ALTER TABLE jobs ADD COLUMN runner TEXT", []);
         for schema in [
             crate::auth::SCHEMA,
             crate::repos::SCHEMA,
@@ -384,7 +387,7 @@ impl Db {
     pub fn jobs(&self, run_id: i64) -> Result<Vec<Job>> {
         let c = self.conn();
         let mut st = c.prepare(
-            "SELECT id, run_id, name, needs, status, exit_code, started_at, finished_at FROM jobs WHERE run_id = ?1 ORDER BY id",
+            "SELECT id, run_id, name, needs, status, exit_code, started_at, finished_at, runner FROM jobs WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = st.query_map([run_id], |r| {
             let needs: String = r.get(3)?;
@@ -397,9 +400,31 @@ impl Db {
                 exit_code: r.get(5)?,
                 started_at: r.get(6)?,
                 finished_at: r.get(7)?,
+                runner: r
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|j| serde_json::from_str(&j).ok()),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn set_job_runner(&self, id: i64, info: &crate::runners::RunnerInfo) -> Result<()> {
+        self.conn().execute(
+            "UPDATE jobs SET runner = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(info)?],
+        )?;
+        Ok(())
+    }
+
+    /// Cloud runner leases recorded by this server since `since` (ms), to check a bill against.
+    pub fn cloud_leases(&self, since: i64) -> Result<Vec<crate::runners::RunnerInfo>> {
+        let c = self.conn();
+        let mut st = c.prepare("SELECT runner FROM jobs WHERE runner IS NOT NULL AND started_at >= ?1")?;
+        let rows = st.query_map([since], |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(|r| r.ok())
+            .filter_map(|j| serde_json::from_str(&j).ok())
+            .collect())
     }
 
     pub fn job_project(&self, id: i64) -> Result<Option<i64>> {

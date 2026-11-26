@@ -10,7 +10,7 @@ use crate::git::GitCache;
 use crate::logs::LogHub;
 use crate::registry::{self, Registry};
 use crate::repos::Repo;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,8 @@ pub struct Engine {
     pub work_dir: PathBuf,
     pub slots: Arc<Semaphore>,
     cancels: Mutex<HashMap<i64, CancellationToken>>,
+    /// Set when this server has a moloko runners subscription.
+    pub cloud: std::sync::OnceLock<crate::runners::CloudConfig>,
 }
 
 /// Everything a job needs that is shared across the run.
@@ -79,6 +81,7 @@ impl Engine {
             work_dir,
             slots: Arc::new(Semaphore::new(executors.max(1))),
             cancels: Mutex::default(),
+            cloud: std::sync::OnceLock::new(),
         }))
     }
 
@@ -340,18 +343,6 @@ impl Engine {
 
     async fn run_job(&self, ctx: &RunCtx, job_id: i64, inst: &JobInstance) -> Status {
         let spec = &ctx.pipeline.jobs[&inst.base];
-        // Agent jobs run elsewhere, so they don't take a local executor slot.
-        let _permit = if spec.agent.is_empty() {
-            tokio::select! {
-                p = self.slots.clone().acquire_owned() => Some(p.expect("semaphore closed")),
-                _ = ctx.cancel.cancelled() => {
-                    let _ = self.db.finish_job(job_id, Status::Cancelled, None);
-                    return Status::Cancelled;
-                }
-            }
-        } else {
-            None
-        };
         let log = match self.logs.open(job_id) {
             Ok(l) => l,
             Err(e) => {
@@ -360,44 +351,24 @@ impl Engine {
                 return Status::Failed;
             }
         };
-        // Open the log before marking the job running, so a viewer that sees `running` can stream it.
-        let _ = self.db.start_job(job_id);
-        let job_dir = self.work_dir.join(job_id.to_string());
-        let ws = job_dir.join(&ctx.repo.name);
         let started = Instant::now();
         let env = job_env(ctx, inst, spec, &self.registry_host);
 
+        // Agent and cloud jobs run elsewhere, so they don't take a local executor slot.
         let (status, code) = if !spec.agent.is_empty() {
+            let _ = self.db.start_job(job_id);
             self.run_on_agents(ctx, spec, &env, &log).await
-        } else {
-            let mut checked_out = Vec::new();
-            let mut failed = None;
-            for (repo_id, sha, dest) in std::iter::once((ctx.repo.id, ctx.sha.clone(), ws.clone()))
-                .chain(ctx.siblings.iter().map(|(r, sha)| (r.id, sha.clone(), job_dir.join(&r.name))))
-            {
-                match self.git.checkout(repo_id, &sha, &dest).await {
-                    Ok(()) => checked_out.push((repo_id, dest)),
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
-                }
-            }
-            let r = match failed {
+        } else if spec.runner.as_deref() == Some("cloud") {
+            let _ = self.db.start_job(job_id);
+            match self.run_on_cloud(ctx, job_id, spec, &env, &log).await {
+                Some(r) => r,
                 None => {
-                    self.run_steps(ctx, job_id, inst, spec, &env, &job_dir, &ws, &log)
-                        .await
+                    log.line("▶ falling back to a local executor");
+                    self.run_local(ctx, job_id, inst, spec, &env, &log).await
                 }
-                Some(e) => {
-                    log.line(&format!("✗ checkout failed: {e:#}"));
-                    (Status::Failed, None)
-                }
-            };
-            for (repo_id, dest) in checked_out {
-                self.git.remove(repo_id, &dest).await;
             }
-            let _ = tokio::fs::remove_dir_all(&job_dir).await;
-            r
+        } else {
+            self.run_local(ctx, job_id, inst, spec, &env, &log).await
         };
         log.line(&format!(
             "● {} in {:.1}s",
@@ -408,6 +379,135 @@ impl Engine {
         self.logs.close(job_id);
         let _ = self.db.finish_job(job_id, status, code);
         status
+    }
+
+    /// Check out the repos and run the steps on this machine, in an executor slot.
+    async fn run_local(
+        &self,
+        ctx: &RunCtx,
+        job_id: i64,
+        inst: &JobInstance,
+        spec: &JobSpec,
+        env: &[(String, String)],
+        log: &crate::logs::JobLog,
+    ) -> (Status, Option<i32>) {
+        let _permit = tokio::select! {
+            p = self.slots.clone().acquire_owned() => p.expect("semaphore closed"),
+            _ = ctx.cancel.cancelled() => return (Status::Cancelled, None),
+        };
+        // Mark the job running only once the log is open, so a viewer that sees `running` can stream it.
+        let _ = self.db.start_job(job_id);
+        let job_dir = self.work_dir.join(job_id.to_string());
+        let ws = job_dir.join(&ctx.repo.name);
+        let mut checked_out = Vec::new();
+        let mut failed = None;
+        for (repo_id, sha, dest) in std::iter::once((ctx.repo.id, ctx.sha.clone(), ws.clone()))
+            .chain(ctx.siblings.iter().map(|(r, sha)| (r.id, sha.clone(), job_dir.join(&r.name))))
+        {
+            match self.git.checkout(repo_id, &sha, &dest).await {
+                Ok(()) => checked_out.push((repo_id, dest)),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let r = match failed {
+            None => {
+                self.run_steps(ctx, job_id, inst, spec, env, &job_dir, &ws, log)
+                    .await
+            }
+            Some(e) => {
+                log.line(&format!("✗ checkout failed: {e:#}"));
+                (Status::Failed, None)
+            }
+        };
+        for (repo_id, dest) in checked_out {
+            self.git.remove(repo_id, &dest).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        r
+    }
+
+    /// Run the job on a moloko runner. `None` means no runner could be leased or verified and
+    /// `fallback: local` is set, so nothing was sent and the job may run here instead.
+    async fn run_on_cloud(
+        &self,
+        ctx: &RunCtx,
+        job_id: i64,
+        spec: &JobSpec,
+        env: &[(String, String)],
+        log: &crate::logs::JobLog,
+    ) -> Option<(Status, Option<i32>)> {
+        let size = spec.size.as_deref().unwrap_or("m");
+        let fallback = spec.fallback.as_deref() == Some("local");
+        let session = match self.cloud.get() {
+            None => Err(anyhow!("this server has no moloko runners subscription (set --cloud-key)")),
+            Some(cfg) => self.lease_with_retry(cfg, size, log, &ctx.cancel).await,
+        };
+        let session = match session {
+            Ok(s) => s,
+            Err(_) if ctx.cancel.is_cancelled() => return Some((Status::Cancelled, None)),
+            Err(e) => {
+                log.line(&format!("✗ {e:#}"));
+                return if fallback { None } else { Some((Status::Failed, None)) };
+            }
+        };
+        let _ = self.db.set_job_runner(job_id, &session.info);
+
+        let job_dir = self.work_dir.join(job_id.to_string());
+        let mut repos = Vec::new();
+        for (repo_id, name, sha) in std::iter::once((ctx.repo.id, &ctx.repo.name, &ctx.sha))
+            .chain(ctx.siblings.iter().map(|(r, sha)| (r.id, &r.name, sha)))
+        {
+            let path = job_dir.join(format!("{name}.bundle"));
+            let made = async {
+                tokio::fs::create_dir_all(&job_dir).await?;
+                self.git.bundle(repo_id, sha, &path).await
+            };
+            if let Err(e) = made.await {
+                log.line(&format!("✗ bundling {name} failed: {e:#}"));
+                let _ = tokio::fs::remove_dir_all(&job_dir).await;
+                return Some((Status::Failed, None));
+            }
+            repos.push((name.clone(), sha.clone(), path));
+        }
+        let job = crate::runners::CloudJob {
+            repos,
+            env: env.to_vec(),
+            steps: spec.steps.iter().map(|s| (s.label(), s.script().to_string())).collect(),
+            image: spec.image.clone(),
+        };
+        let (status, code, info) = session.run(job, &|l| log.line(l), &ctx.cancel).await;
+        let _ = tokio::fs::remove_dir_all(&job_dir).await;
+        log.line(&format!("▶ cloud runner released: {:.1} m-minutes", info.m_minutes()));
+        let _ = self.db.set_job_runner(job_id, &info);
+        Some((status, code))
+    }
+
+    /// The broker answers 503 while its warm pool is empty; wait up to a minute for capacity.
+    async fn lease_with_retry(
+        &self,
+        cfg: &crate::runners::CloudConfig,
+        size: &str,
+        log: &crate::logs::JobLog,
+        cancel: &CancellationToken,
+    ) -> Result<crate::runners::Session> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let line = |l: &str| log.line(l);
+        loop {
+            let r = tokio::select! {
+                r = crate::runners::lease(cfg, size, &line) => r,
+                _ = cancel.cancelled() => bail!("cancelled"),
+            };
+            match r {
+                Err(e) if format!("{e}").contains("(503)") && Instant::now() < deadline => {
+                    log.line("▶ waiting for a cloud runner…");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                r => return r,
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -445,7 +545,7 @@ impl Engine {
                     job_dir,
                     &format!("/workspace/{}", ctx.repo.name),
                     env,
-                    log,
+                    &|l| log.line(l),
                 )
                 .await {
                     Ok(e) => e,

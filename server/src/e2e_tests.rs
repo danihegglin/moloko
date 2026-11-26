@@ -460,3 +460,103 @@ async fn ai_agent_implements_assigned_issue() {
     assert!(rv["status"]["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().contains("person")), "{}", rv["status"]);
     assert_eq!(d["issue"]["status"], "in_review");
 }
+
+/// A broker on a random port plus one dev-mode runner of size `m` in its warm pool.
+async fn cloud(srv: &Server, insecure_dev: bool, runners: usize) -> (Arc<crate::runners::broker::Broker>, String) {
+    use crate::runners::{CloudConfig, attest::Policy, broker, runner};
+    let data = srv.dir.path().join("broker");
+    let b = broker::Broker::open(&data, "pool-secret").unwrap();
+    let key = b.add_key("acme", "team").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = broker::router(b.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for i in 0..runners {
+        let opts = runner::Options {
+            broker: url.clone(),
+            pool_token: "pool-secret".into(),
+            size: "m".into(),
+            dev: true,
+            amd_product: "Milan".into(),
+            vcek: None,
+            workdir: srv.dir.path().join(format!("runner-{i}")),
+        };
+        tokio::spawn(async move { runner::run(opts).await.unwrap() });
+    }
+    let policy = Policy { measurements: vec![], insecure_dev };
+    srv.engine.cloud.set(CloudConfig { broker: url.clone(), key: key.clone(), policy }).unwrap();
+    (b, key)
+}
+
+async fn job_log(srv: &Server, repo_id: i64, sha: &str) -> (crate::db::Job, String) {
+    let run = srv.engine.db.run_for_sha(repo_id, sha).unwrap().unwrap();
+    let job = srv.engine.db.jobs(run.id).unwrap().remove(0);
+    let log = std::fs::read_to_string(srv.dir.path().join(format!("data/logs/{}.log", job.id))).unwrap();
+    (job, log)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cloud_runner_runs_job_and_meters_it() {
+    let srv = Server::start().await;
+    let (broker, _) = cloud(&srv, true, 1).await;
+    let (_, p) = srv.api("POST", "/api/projects", Some(serde_json::json!({"name": "shop", "key": "SHOP"}))).await;
+    let pid = p["id"].as_i64().unwrap();
+    let (_, repo) = srv.api("POST", &format!("/api/projects/{pid}/repos"), Some(serde_json::json!({"name": "api"}))).await;
+    let rid = repo["id"].as_i64().unwrap();
+    let work = srv.dir.path().join("shop-api");
+    ok(srv.dir.path(), &["clone", "-q", &srv.url("shop", "api"), work.to_str().unwrap()]);
+    std::fs::write(
+        work.join(".moloko.yml"),
+        "jobs:\n  test:\n    runner: cloud\n    steps:\n      - cat app.txt\n      - git log -1 --format=commit-%s\n      - echo \"shard $MOLOKO_SHARD_INDEX\"\n",
+    )
+    .unwrap();
+    let sha = commit(&work, "app.txt", "secret-sauce\n", "initial");
+    ok(&work, &["push", "-q", "origin", "HEAD:main"]);
+    let status = wait_run(&srv.engine, rid, &sha).await;
+    let (job, log) = job_log(&srv, rid, &sha).await;
+    assert_eq!(status, "success", "{log}");
+    assert!(log.contains("runner attested: dev (insecure)"), "{log}");
+    assert!(log.contains("secret-sauce"), "file from the bundle: {log}");
+    assert!(log.contains("commit-initial"), "history from the bundle: {log}");
+    assert!(log.contains("shard 0"), "{log}");
+    let info = job.runner.expect("runner info recorded");
+    assert_eq!(info.size, "m");
+    assert!(info.ended_at.is_some());
+    assert_eq!(info.m_minutes(), 1.0);
+
+    // The broker metered the same lease; the server's own view agrees.
+    eventually(|| broker.usage(1).unwrap() == (1.0, 0)).await;
+    let (_, c) = srv.api("GET", "/api/cloud", None).await;
+    assert_eq!(c["configured"], true);
+    assert_eq!(c["m_minutes"], 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unverified_runner_gets_nothing_and_job_falls_back() {
+    let srv = Server::start().await;
+    // The server demands hardware attestation; the only runner is a dev runner.
+    cloud(&srv, false, 2).await;
+    let (_, p) = srv.api("POST", "/api/projects", Some(serde_json::json!({"name": "shop", "key": "SHOP"}))).await;
+    let pid = p["id"].as_i64().unwrap();
+    let (_, repo) = srv.api("POST", &format!("/api/projects/{pid}/repos"), Some(serde_json::json!({"name": "api"}))).await;
+    let rid = repo["id"].as_i64().unwrap();
+    let work = srv.dir.path().join("shop-api");
+    ok(srv.dir.path(), &["clone", "-q", &srv.url("shop", "api"), work.to_str().unwrap()]);
+
+    std::fs::write(work.join(".moloko.yml"), "jobs:\n  test:\n    runner: cloud\n    steps: [cat app.txt]\n").unwrap();
+    let sha = commit(&work, "app.txt", "secret-sauce\n", "strict");
+    ok(&work, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(wait_run(&srv.engine, rid, &sha).await, "failed");
+    let (job, log) = job_log(&srv, rid, &sha).await;
+    assert!(log.contains("attestation failed"), "{log}");
+    assert!(!log.contains("secret-sauce"), "{log}");
+    assert!(job.runner.is_none());
+
+    std::fs::write(work.join(".moloko.yml"), "jobs:\n  test:\n    runner: cloud\n    fallback: local\n    steps: [cat app.txt]\n").unwrap();
+    let sha = commit(&work, "app.txt", "secret-sauce\n", "fallback");
+    ok(&work, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(wait_run(&srv.engine, rid, &sha).await, "success");
+    let (_, log) = job_log(&srv, rid, &sha).await;
+    assert!(log.contains("attestation failed") && log.contains("falling back to a local executor"), "{log}");
+    assert!(log.contains("secret-sauce"), "ran locally: {log}");
+}

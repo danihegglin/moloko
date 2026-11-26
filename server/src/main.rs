@@ -17,6 +17,7 @@ mod mirror;
 mod registry;
 mod repos;
 mod reviews;
+mod runners;
 mod tunnel;
 mod users_api;
 
@@ -60,6 +61,38 @@ enum Command {
         /// How often mirrored repos poll upstream, in seconds (webhooks make it immediate).
         #[arg(long, env = "MOLOKO_MIRROR_INTERVAL", default_value_t = 300)]
         mirror_interval: u64,
+        #[command(flatten)]
+        cloud: CloudArgs,
+    },
+    /// Run the moloko cloud broker: subscription keys, the runner warm pool, the relay, metering.
+    Broker {
+        #[command(subcommand)]
+        command: BrokerCommand,
+    },
+    /// Run a cloud runner inside a confidential VM: take one job from the broker, run it, exit.
+    Runner {
+        /// Broker base URL, e.g. https://runners.example.com
+        #[arg(long, env = "MOLOKO_BROKER")]
+        broker: String,
+        /// Token that lets runners join the broker's warm pool.
+        #[arg(long, env = "MOLOKO_POOL_TOKEN", hide_env_values = true)]
+        pool_token: String,
+        /// Size class this VM was booted as: s, m, l or xl.
+        #[arg(long, env = "MOLOKO_RUNNER_SIZE", default_value = "m")]
+        size: String,
+        /// No hardware attestation, for local development. Servers refuse it unless they run
+        /// with --cloud-insecure-dev.
+        #[arg(long)]
+        dev: bool,
+        /// AMD product for fetching the chip's VCEK certificate: Milan or Genoa.
+        #[arg(long, env = "MOLOKO_AMD_PRODUCT", default_value = "Milan")]
+        amd_product: String,
+        /// VCEK certificate (DER) to use instead of fetching it from AMD.
+        #[arg(long, env = "MOLOKO_VCEK")]
+        vcek: Option<PathBuf>,
+        /// Scratch directory for the job. Use the VM's encrypted scratch disk.
+        #[arg(long, env = "MOLOKO_WORKDIR", default_value = "/var/lib/moloko-runner")]
+        workdir: PathBuf,
     },
     /// Run a deploy agent on a target server. It connects out to the moloko server.
     Agent {
@@ -94,6 +127,65 @@ enum Command {
     },
 }
 
+/// How `moloko serve` reaches moloko runners.
+#[derive(clap::Args)]
+struct CloudArgs {
+    /// moloko runners subscription key (`mlkcloud_…`). Enables `runner: cloud` jobs.
+    #[arg(long, env = "MOLOKO_CLOUD_KEY", hide_env_values = true)]
+    cloud_key: Option<String>,
+    /// Broker URL for moloko runners.
+    #[arg(long, env = "MOLOKO_CLOUD_BROKER")]
+    cloud_broker: Option<String>,
+    /// Launch measurements (hex) of runner images this server accepts, comma-separated.
+    #[arg(long, env = "MOLOKO_CLOUD_MEASUREMENTS", value_delimiter = ',')]
+    cloud_measurements: Vec<String>,
+    /// Accept runners without hardware attestation. For local development only: such a runner's
+    /// operator can read everything the job sends.
+    #[arg(long, env = "MOLOKO_CLOUD_INSECURE_DEV")]
+    cloud_insecure_dev: bool,
+}
+
+impl CloudArgs {
+    fn config(self) -> Result<Option<runners::CloudConfig>> {
+        match (self.cloud_key, self.cloud_broker) {
+            (None, _) => Ok(None),
+            (Some(_), None) => anyhow::bail!("--cloud-key needs --cloud-broker"),
+            (Some(key), Some(broker)) => Ok(Some(runners::CloudConfig {
+                broker,
+                key,
+                policy: runners::attest::Policy {
+                    measurements: self.cloud_measurements,
+                    insecure_dev: self.cloud_insecure_dev,
+                },
+            })),
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BrokerCommand {
+    /// Serve the broker API.
+    Serve {
+        #[arg(long, env = "MOLOKO_BROKER_LISTEN", default_value = "127.0.0.1:8090")]
+        listen: String,
+        #[arg(long, env = "MOLOKO_BROKER_DATA", default_value = "moloko-broker")]
+        data: PathBuf,
+        /// Token runner VMs present to join the warm pool.
+        #[arg(long, env = "MOLOKO_POOL_TOKEN", hide_env_values = true)]
+        pool_token: String,
+    },
+    /// Create an account (or change its plan) and print a new subscription key.
+    AddKey {
+        #[arg(long, env = "MOLOKO_BROKER_DATA", default_value = "moloko-broker")]
+        data: PathBuf,
+        #[arg(long)]
+        account: String,
+        /// trial, team or business
+        #[arg(long, default_value = "trial")]
+        plan: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -112,6 +204,7 @@ async fn main() -> Result<()> {
             wg_listen,
             wg_endpoint,
             mirror_interval,
+            cloud,
         } => {
             let executors = executors.unwrap_or_else(|| {
                 std::thread::available_parallelism()
@@ -120,6 +213,13 @@ async fn main() -> Result<()> {
             });
             let registry_host = registry_host.unwrap_or_else(|| default_registry_host(&listen));
             let engine = engine::Engine::new(&data, executors, &registry_host)?;
+            if let Some(cfg) = cloud.config()? {
+                if cfg.policy.insecure_dev {
+                    tracing::warn!("--cloud-insecure-dev: cloud runners are NOT verified; use only for development");
+                }
+                tracing::info!("moloko runners enabled via {}", cfg.broker);
+                let _ = engine.cloud.set(cfg);
+            }
             let wg = if wg_listen == "off" {
                 None
             } else {
@@ -168,6 +268,34 @@ async fn main() -> Result<()> {
             }
             _ => anyhow::bail!("pass --join <code>, or --server and --token"),
         },
+        Command::Broker { command } => match command {
+            BrokerCommand::Serve { listen, data, pool_token } => {
+                let broker = runners::broker::Broker::open(&data, &pool_token)?;
+                let listener = tokio::net::TcpListener::bind(&listen).await?;
+                tracing::info!("moloko broker listening on http://{listen}");
+                axum::serve(listener, runners::broker::router(broker))
+                    .with_graceful_shutdown(shutdown())
+                    .await?;
+            }
+            BrokerCommand::AddKey { data, account, plan } => {
+                // The pool token isn't needed to issue keys.
+                let broker = runners::broker::Broker::open(&data, "")?;
+                println!("{}", broker.add_key(&account, &plan)?);
+            }
+        },
+        Command::Runner { broker, pool_token, size, dev, amd_product, vcek, workdir } => {
+            anyhow::ensure!(runners::weight(&size).is_some(), "size must be s, m, l or xl");
+            runners::runner::run(runners::runner::Options {
+                broker,
+                pool_token,
+                size,
+                dev,
+                amd_product,
+                vcek,
+                workdir,
+            })
+            .await?;
+        }
         Command::Validate { file } => {
             let pipeline = config::Pipeline::parse(&std::fs::read_to_string(&file)?)?;
             for job in pipeline.expand() {

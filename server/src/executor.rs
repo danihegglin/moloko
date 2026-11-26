@@ -1,7 +1,6 @@
 //! Runs job steps directly on the host, or inside one warm Docker container per job
 //! (started once, then `docker exec` per step).
 
-use crate::logs::JobLog;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::Stdio;
@@ -26,9 +25,9 @@ impl Executor {
         mount: &Path,
         workdir: &str,
         env: &[(String, String)],
-        log: &JobLog,
+        log: &(dyn Fn(&str) + Sync),
     ) -> Result<Self> {
-        log.line(&format!("▶ docker: starting {image}"));
+        log(&format!("▶ docker: starting {image}"));
         let mut cmd = Command::new("docker");
         cmd.args([
             "run",

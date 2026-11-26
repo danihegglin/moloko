@@ -367,7 +367,7 @@ async fn run_in_env(
     let name = format!("moloko-ai-{session}");
     let result = match agent.environment.kind.as_str() {
         "container" => {
-            let exec = Executor::docker(&agent.environment.image, &name, &ws.dir, &format!("/workspace/{}", ws.primary.name), env, log).await?;
+            let exec = Executor::docker(&agent.environment.image, &name, &ws.dir, &format!("/workspace/{}", ws.primary.name), env, &|l| log.line(l)).await?;
             let r = tokio::time::timeout(timeout, exec.run_step(script, &workdir, env, &|l| log.line(l), cancel)).await;
             exec.shutdown().await;
             r

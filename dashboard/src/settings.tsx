@@ -616,6 +616,42 @@ function AgentForm({ pid, agent, onDone }: { pid: number; agent: Partial<AiAgent
   )
 }
 
+/** moloko runners: subscription status and the minutes this server recorded itself this month. */
+function CloudRunners() {
+  const cloud = usePoll(api.cloud, 60000, [])
+  const c = cloud.data
+  if (!c) return null
+  return (
+    <section className="settings">
+      <h2>Cloud runners</h2>
+      {c.configured ? (
+        <>
+          <p className="muted small-text">
+            Jobs with <code>runner: cloud</code> run on attested confidential VMs via {c.broker}. This server checks each runner's
+            hardware attestation before it sends any source or secrets.
+          </p>
+          {c.insecure_dev && (
+            <p className="error">Development mode: runners are not verified, so whoever runs them can read your jobs.</p>
+          )}
+          <div className="inline">
+            <strong>{c.m_minutes.toFixed(0)} m-minutes</strong>
+            <span className="muted small-text">this month, {c.jobs} cloud jobs, as recorded by this server</span>
+          </div>
+          <p className="muted small-text">
+            Accepted runner images:{' '}
+            {c.measurements?.length ? c.measurements.map((m) => <code key={m}>{m.slice(0, 16)}…</code>) : 'none (set --cloud-measurements)'}
+          </p>
+        </>
+      ) : (
+        <p className="muted small-text">
+          Not subscribed. Start the server with <code>--cloud-key</code> and <code>--cloud-broker</code> to run jobs marked{' '}
+          <code>runner: cloud</code> on moloko runners.
+        </p>
+      )}
+    </section>
+  )
+}
+
 export function AccountPage({ me }: { me: User }) {
   const tokens = usePoll(api.tokens, 60000, [])
   const users = usePoll(() => (me.is_admin ? api.users() : Promise.resolve([] as User[])), 60000, [])
@@ -690,6 +726,7 @@ export function AccountPage({ me }: { me: User }) {
           </button>
         </form>
       </section>
+      {me.is_admin && <CloudRunners />}
       {me.is_admin && (
         <section className="settings">
           <h2>Users</h2>

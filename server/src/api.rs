@@ -63,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents/{id}", delete(delete_agent))
         .route("/api/agents/{id}/join", post(rotate_join))
         .route("/api/images", get(list_images))
+        .route("/api/cloud", get(cloud_status))
         .merge(crate::users_api::routes())
         .merge(crate::code::routes())
         .merge(crate::issues::routes())
@@ -394,6 +395,25 @@ async fn job_logs(
         yield Ok(Event::default().event("end").data(""));
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// moloko runners: whether this server has a subscription, what it accepts, and the minutes it
+/// recorded itself this month, to check the bill against.
+async fn cloud_status(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let since = crate::runners::broker::month_start_ms(crate::db::now_ms());
+    let leases = s.engine.db.cloud_leases(since)?;
+    let m_minutes: f64 = leases.iter().map(|l| l.m_minutes()).sum();
+    Ok(Json(match s.engine.cloud.get() {
+        None => json!({ "configured": false, "m_minutes": m_minutes, "jobs": leases.len() }),
+        Some(c) => json!({
+            "configured": true,
+            "broker": c.broker,
+            "measurements": c.policy.measurements,
+            "insecure_dev": c.policy.insecure_dev,
+            "m_minutes": m_minutes,
+            "jobs": leases.len(),
+        }),
+    }))
 }
 
 async fn list_agents(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {

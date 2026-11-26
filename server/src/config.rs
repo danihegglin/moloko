@@ -90,6 +90,12 @@ pub struct JobSpec {
     /// Run steps on every connected deploy agent carrying all of these labels.
     #[serde(default, deserialize_with = "one_or_many")]
     pub agent: Vec<String>,
+    /// `cloud`: run on moloko runners (attested confidential VMs) instead of this machine.
+    pub runner: Option<String>,
+    /// Cloud runner size: s, m (default), l or xl.
+    pub size: Option<String>,
+    /// `local`: run here when no cloud runner can be leased or attested. Default: fail the job.
+    pub fallback: Option<String>,
     /// Split the job into N parallel instances (MOLOKO_SHARD_INDEX / MOLOKO_SHARD_TOTAL).
     pub shards: Option<u32>,
     #[serde(default)]
@@ -192,6 +198,28 @@ impl Pipeline {
             {
                 bail!("job {name:?}: agent jobs cannot use image, cache or shards");
             }
+            match job.runner.as_deref() {
+                None => {
+                    if job.size.is_some() || job.fallback.is_some() {
+                        bail!("job {name:?}: size and fallback need runner: cloud");
+                    }
+                }
+                Some("cloud") => {
+                    if !job.agent.is_empty() {
+                        bail!("job {name:?}: a job runs either on agents or on cloud runners, not both");
+                    }
+                    if !job.cache.is_empty() {
+                        bail!("job {name:?}: cloud jobs can't use cache yet");
+                    }
+                    if job.size.as_deref().is_some_and(|s| crate::runners::weight(s).is_none()) {
+                        bail!("job {name:?}: size must be s, m, l or xl");
+                    }
+                    if job.fallback.as_deref().is_some_and(|f| f != "local") {
+                        bail!("job {name:?}: fallback must be local");
+                    }
+                }
+                Some(other) => bail!("job {name:?}: unknown runner {other:?} (only cloud)"),
+            }
             if job.steps.is_empty() {
                 bail!("job {name:?} has no steps");
             }
@@ -277,6 +305,22 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_runner_fields() {
+        let ok = "jobs:\n  t:\n    runner: cloud\n    size: l\n    fallback: local\n    shards: 4\n    steps: [make test]\n";
+        let p = Pipeline::parse(ok).unwrap();
+        assert_eq!(p.jobs["t"].runner.as_deref(), Some("cloud"));
+        for bad in [
+            "jobs:\n  t:\n    runner: gpu\n    steps: [x]\n",
+            "jobs:\n  t:\n    runner: cloud\n    size: huge\n    steps: [x]\n",
+            "jobs:\n  t:\n    size: l\n    steps: [x]\n",
+            "jobs:\n  t:\n    runner: cloud\n    agent: prod\n    steps: [x]\n",
+            "jobs:\n  t:\n    runner: cloud\n    cache: [{path: target}]\n    steps: [x]\n",
+        ] {
+            assert!(Pipeline::parse(bad).is_err(), "accepted: {bad}");
+        }
+    }
 
     #[test]
     fn parses_and_expands_shards() {

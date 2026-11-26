@@ -274,6 +274,25 @@ export interface Job {
   exit_code: number | null
   started_at: number | null
   finished_at: number | null
+  runner: RunnerInfo | null
+}
+
+/** Set on jobs that ran on a moloko cloud runner. */
+export interface RunnerInfo {
+  size: string
+  lease: string
+  attestation: { kind: string; measurement: string; chip: string; reported_tcb: string }
+  started_at: number
+  ended_at: number | null
+}
+
+export interface CloudStatus {
+  configured: boolean
+  broker?: string
+  measurements?: string[]
+  insecure_dev?: boolean
+  m_minutes: number
+  jobs: number
 }
 
 export interface AgentRow {
@@ -335,6 +354,7 @@ export const api = {
   tokens: () => request<TokenRow[]>('GET', '/api/tokens'),
   createToken: (name: string) => request<{ id: number; token: string }>('POST', '/api/tokens', { name }),
   deleteToken: (id: number) => request<void>('DELETE', `/api/tokens/${id}`),
+  cloud: () => request<CloudStatus>('GET', '/api/cloud'),
 
   projects: () => request<Project[]>('GET', '/api/projects'),
   project: (id: number) => request<ProjectDetail>('GET', `/api/projects/${id}`),

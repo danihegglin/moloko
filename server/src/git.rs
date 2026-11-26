@@ -195,6 +195,19 @@ impl GitCache {
         Ok(())
     }
 
+    /// Write a git bundle holding `sha` and its history to `out`, for shipping to a cloud runner.
+    pub async fn bundle(&self, repo_id: i64, sha: &str, out: &Path) -> Result<()> {
+        let lock = self.lock(repo_id);
+        let _g = lock.lock().await;
+        let repo = self.path(repo_id);
+        // `git bundle` needs a ref, not a bare sha.
+        let tmp_ref = format!("refs/moloko/bundle/{sha}");
+        git(&["update-ref", &tmp_ref, sha], Some(&repo)).await?;
+        let r = git(&["bundle", "create", "--quiet", out.to_str().unwrap(), &tmp_ref], Some(&repo)).await;
+        let _ = git(&["update-ref", "-d", &tmp_ref], Some(&repo)).await;
+        r.map(|_| ())
+    }
+
     pub async fn remove(&self, repo_id: i64, dest: &Path) {
         let lock = self.lock(repo_id);
         let _g = lock.lock().await;

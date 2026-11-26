@@ -100,6 +100,22 @@ Agents run on the servers you deploy to. They connect to moloko over **built-in 
 
 Without WireGuard, `moloko agent --server wss://…/api/agents/connect --token mlk_…` still connects over a WebSocket. Use that when the server sits behind something like Tailscale or Cloudflare Tunnel.
 
+## Cloud runners (moloko runners)
+
+Mark a job `runner: cloud` to run it on moloko runners: single-use confidential VMs (AMD SEV-SNP) rented by the minute. This server verifies each runner's hardware attestation before it sends source or secrets, and the channel to the runner is encrypted end to end, so the cloud operator can't read your jobs.
+
+```yaml
+jobs:
+  test:
+    runner: cloud
+    size: l            # s | m | l | xl
+    shards: 16
+    fallback: local    # run here if no runner can be leased or verified
+    steps: [./scripts/test-shard.sh "$MOLOKO_SHARD_INDEX" "$MOLOKO_SHARD_TOTAL"]
+```
+
+Enable it with `--cloud-key`, `--cloud-broker` and `--cloud-measurements` (the runner images you accept). See [docs/runners.md](../docs/runners.md) for the trust model, the broker and runner commands, and what isn't built yet.
+
 ## Users and access
 
 - **Accounts.** The first account is an admin. Admins add more users under **Account**. Passwords are hashed with Argon2, and the dashboard uses an HTTP-only session cookie.
@@ -252,6 +268,7 @@ Everything except `/api/auth/*`, the webhook, agent connections and the registry
 | `POST /api/agents/:id/join` | rotate the agent's WireGuard key and token, returns a new join code |
 | `GET /api/agents/connect` | agent WebSocket (`Authorization: Bearer <token>`) |
 | `GET /api/images` | registry repositories and tags |
+| `GET /api/cloud` | moloko runners status and the m-minutes this server recorded this month |
 | `/v2/…` | OCI Distribution API (Basic auth: run token or `<agent>:<agent token>`) |
 
 ## Dashboard development

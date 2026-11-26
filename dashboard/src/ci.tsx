@@ -157,6 +157,7 @@ function JobGraph({ jobs, selected, onSelect, now }: { jobs: Job[]; selected?: n
             <button key={j.id} className={`job ${j.status} ${j.id === selected ? 'selected' : ''}`} onClick={() => onSelect(j.id)}>
               <span className="dot" />
               <span className="job-name">{j.name}</span>
+              {j.runner && <span className="label">cloud {j.runner.size}</span>}
               <span className="muted">{duration(j.started_at, j.finished_at, now)}</span>
             </button>
           ))}
@@ -211,6 +212,12 @@ function LogView({ job }: { job: Job }) {
       <div className="logs-head">
         <strong>{job.name}</strong> <Badge status={job.status} />
         {job.exit_code != null && job.exit_code !== 0 && <span className="muted"> exit {job.exit_code}</span>}
+        {job.runner && (
+          <span className="muted small-text" title={job.runner.attestation.measurement ? `image measurement ${job.runner.attestation.measurement}` : undefined}>
+            {' '}· cloud runner {job.runner.size}, {job.runner.attestation.kind}
+            {job.runner.attestation.measurement && `, image ${job.runner.attestation.measurement.slice(0, 12)}…`}
+          </span>
+        )}
       </div>
       <div className="log-box" ref={box} onScroll={onScroll}>
         {lines.map((l, i) => (

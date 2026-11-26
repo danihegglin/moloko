@@ -1,14 +1,24 @@
 mod agents;
+mod ai;
 mod api;
+mod auth;
 mod cache;
+mod code;
 mod config;
+mod crypto;
 mod db;
 mod engine;
 mod executor;
 mod git;
+mod githttp;
+mod issues;
 mod logs;
+mod mirror;
 mod registry;
+mod repos;
+mod reviews;
 mod tunnel;
+mod users_api;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -25,7 +35,7 @@ struct Cli {
 enum Command {
     /// Run the build server and dashboard.
     Serve {
-        /// Address to listen on. Defaults to localhost: there is no authentication yet.
+        /// Address to listen on. Create the first admin in the dashboard before exposing it.
         #[arg(long, env = "MOLOKO_LISTEN", default_value = "127.0.0.1:8080")]
         listen: String,
         /// Directory for the database, git mirrors, caches, logs and workspaces.
@@ -47,6 +57,9 @@ enum Command {
         /// Shared secret for GitHub webhooks. Webhooks are rejected when unset.
         #[arg(long, env = "MOLOKO_WEBHOOK_SECRET", hide_env_values = true)]
         webhook_secret: Option<String>,
+        /// How often mirrored repos poll upstream, in seconds (webhooks make it immediate).
+        #[arg(long, env = "MOLOKO_MIRROR_INTERVAL", default_value_t = 300)]
+        mirror_interval: u64,
     },
     /// Run a deploy agent on a target server. It connects out to the moloko server.
     Agent {
@@ -98,6 +111,7 @@ async fn main() -> Result<()> {
             registry_host,
             wg_listen,
             wg_endpoint,
+            mirror_interval,
         } => {
             let executors = executors.unwrap_or_else(|| {
                 std::thread::available_parallelism()
@@ -121,6 +135,8 @@ async fn main() -> Result<()> {
                     .await?,
                 )
             };
+            mirror::spawn_loop(engine.clone(), std::time::Duration::from_secs(mirror_interval.max(10)));
+            crate::reviews::spawn_queue(engine.clone());
             let app = api::router(api::AppState {
                 wg,
                 engine,
@@ -240,3 +256,5 @@ async fn shutdown() {
         _ = term.recv() => {}
     }
 }
+#[cfg(test)]
+mod e2e_tests;

@@ -23,7 +23,8 @@ impl Executor {
     pub async fn docker(
         image: &str,
         name: &str,
-        workspace: &Path,
+        mount: &Path,
+        workdir: &str,
         env: &[(String, String)],
         log: &JobLog,
     ) -> Result<Self> {
@@ -38,10 +39,10 @@ impl Executor {
             "--entrypoint",
             "sh",
             "-w",
-            "/workspace",
+            workdir,
             "-v",
         ])
-        .arg(format!("{}:/workspace", workspace.display()));
+        .arg(format!("{}:/workspace", mount.display()));
         for (k, v) in env {
             cmd.arg("-e").arg(format!("{k}={v}"));
         }

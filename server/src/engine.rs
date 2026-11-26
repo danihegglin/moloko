@@ -9,6 +9,7 @@ use crate::executor::{Executor, StepResult};
 use crate::git::GitCache;
 use crate::logs::LogHub;
 use crate::registry::{self, Registry};
+use crate::repos::Repo;
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,22 +25,31 @@ pub struct Engine {
     pub agents: AgentHub,
     pub registry: Registry,
     pub registry_host: String,
-    git: GitCache,
+    pub git: GitCache,
+    pub secrets: crate::crypto::Secrets,
+    pub ai: crate::ai::AiHub,
+    /// Wakes the merge queue when a review is queued or a queue run ends.
+    pub queue_notify: tokio::sync::Notify,
     cache: Cache,
-    work_dir: PathBuf,
-    slots: Arc<Semaphore>,
+    pub work_dir: PathBuf,
+    pub slots: Arc<Semaphore>,
     cancels: Mutex<HashMap<i64, CancellationToken>>,
 }
 
 /// Everything a job needs that is shared across the run.
-struct RunCtx {
-    run_id: i64,
-    project_id: i64,
-    project_name: String,
-    git_ref: String,
-    sha: String,
-    pipeline: Pipeline,
-    cancel: CancellationToken,
+pub struct RunCtx {
+    pub run_id: i64,
+    pub project_id: i64,
+    pub project_name: String,
+    pub repo: Repo,
+    /// Other repos checked out next to this one, at the resolved sha.
+    pub siblings: Vec<(Repo, String)>,
+    pub git_ref: String,
+    pub sha: String,
+    pub pipeline: Pipeline,
+    pub cancel: CancellationToken,
+    /// Number of the open review for this branch, for preview deploys.
+    pub review: Option<i64>,
     /// Read-write registry credential, valid only while the run is active.
     registry_token: String,
 }
@@ -51,7 +61,7 @@ impl Engine {
         executors: usize,
         registry_host: &str,
     ) -> Result<Arc<Self>> {
-        for d in ["git", "cache", "logs", "work"] {
+        for d in ["repos", "cache", "logs", "work"] {
             std::fs::create_dir_all(data_dir.join(d))?;
         }
         let work_dir = data_dir.join("work").canonicalize()?;
@@ -61,7 +71,10 @@ impl Engine {
             agents: AgentHub::default(),
             registry: Registry::new(&data_dir.join("registry"))?,
             registry_host: registry_host.to_string(),
-            git: GitCache::new(&data_dir.join("git")),
+            git: GitCache::new(&data_dir.join("repos")),
+            secrets: crate::crypto::Secrets::load(data_dir)?,
+            ai: crate::ai::AiHub::default(),
+            queue_notify: tokio::sync::Notify::new(),
             cache: Cache::new(&data_dir.join("cache")),
             work_dir,
             slots: Arc::new(Semaphore::new(executors.max(1))),
@@ -72,22 +85,26 @@ impl Engine {
     /// Queue a run and return its id immediately; the work happens in the background.
     pub fn trigger(
         self: &Arc<Self>,
-        project_id: i64,
+        repo_id: i64,
         git_ref: &str,
         sha: Option<&str>,
         trigger: &str,
     ) -> Result<i64> {
+        let repo = self
+            .db
+            .repo(repo_id)?
+            .ok_or_else(|| anyhow!("repo {repo_id} not found"))?;
         let project = self
             .db
-            .project(project_id)?
-            .ok_or_else(|| anyhow!("project {project_id} not found"))?;
-        let run_id = self.db.create_run(project_id, git_ref, trigger)?;
+            .project(repo.project_id)?
+            .ok_or_else(|| anyhow!("project {} not found", repo.project_id))?;
+        let run_id = self.db.create_run(project.id, repo.id, git_ref, trigger)?;
         let cancel = CancellationToken::new();
         self.cancels.lock().unwrap().insert(run_id, cancel.clone());
         let this = self.clone();
         let (git_ref, sha) = (git_ref.to_string(), sha.map(str::to_string));
         tokio::spawn(async move {
-            let status = match this.prepare(run_id, &project, git_ref, sha, cancel).await {
+            let status = match this.prepare(run_id, &project, &repo, git_ref, sha, cancel).await {
                 Ok(ctx) => this.execute(Arc::new(ctx)).await,
                 Err(e) => {
                     tracing::warn!(run_id, "run failed before start: {e:#}");
@@ -103,6 +120,25 @@ impl Engine {
         Ok(run_id)
     }
 
+    /// Make a run cancellable from the API (used by AI agent sessions, which aren't pipelines).
+    pub fn register_cancel(&self, run_id: i64) -> CancellationToken {
+        let t = CancellationToken::new();
+        self.cancels.lock().unwrap().insert(run_id, t.clone());
+        t
+    }
+
+    pub fn unregister_cancel(&self, run_id: i64) {
+        self.cancels.lock().unwrap().remove(&run_id);
+    }
+
+    pub fn grant_registry(&self, token: &str) {
+        self.registry.grant_run_token(token);
+    }
+
+    pub fn revoke_registry(&self, token: &str) {
+        self.registry.revoke_run_token(token);
+    }
+
     pub fn cancel(&self, run_id: i64) -> bool {
         match self.cancels.lock().unwrap().get(&run_id) {
             Some(t) => {
@@ -114,19 +150,24 @@ impl Engine {
     }
 
     async fn prepare(
-        &self,
+        self: &Arc<Self>,
         run_id: i64,
         project: &crate::db::Project,
+        repo: &Repo,
         git_ref: String,
         sha: Option<String>,
         cancel: CancellationToken,
     ) -> Result<RunCtx> {
         let project_id = project.id;
-        let mirror = self
-            .git
-            .sync(project_id, &project.repo_url)
-            .await
-            .context("git sync")?;
+        let mirror = self.git.ensure(repo.id, &repo.default_branch).await?;
+        if sha.is_none() {
+            crate::mirror::sync(self, repo).await.context("git sync")?;
+        }
+        let git_ref = if git_ref == "HEAD" {
+            format!("refs/heads/{}", self.db.repo(repo.id)?.unwrap_or_else(|| repo.clone()).default_branch)
+        } else {
+            git_ref
+        };
         let sha = match sha {
             Some(s) => s,
             None => self.git.resolve(&mirror, &git_ref).await?,
@@ -137,11 +178,35 @@ impl Engine {
             .await
             .with_context(|| format!("no {PIPELINE_FILE} at {sha}"))?;
         let pipeline = Pipeline::parse(&src)?;
+        let mut siblings = Vec::new();
+        for c in &pipeline.checkout {
+            let sib = self
+                .db
+                .repo_by_name(project_id, &c.repo)?
+                .ok_or_else(|| anyhow!("checkout: project has no repo {:?}", c.repo))?;
+            let path = self.git.ensure(sib.id, &sib.default_branch).await?;
+            if self.git.refs(&path).await?.is_empty() {
+                crate::mirror::sync(self, &sib).await?;
+            }
+            let want = if c.git_ref == "same-branch" {
+                let branch = git_ref.strip_prefix("refs/heads/").unwrap_or(&git_ref);
+                match self.git.resolve(&path, &format!("refs/heads/{branch}")).await {
+                    Ok(s) => s,
+                    Err(_) => self.git.resolve(&path, &sib.default_branch).await?,
+                }
+            } else {
+                self.git.resolve(&path, &c.git_ref).await?
+            };
+            siblings.push((sib, want));
+        }
         self.db.start_run(run_id, &sha)?;
         Ok(RunCtx {
             run_id,
             project_id,
             project_name: project.name.clone(),
+            repo: repo.clone(),
+            siblings,
+            review: crate::reviews::review_for_branch(&self.db, repo.id, &git_ref),
             git_ref,
             sha,
             pipeline,
@@ -158,7 +223,52 @@ impl Engine {
         };
         self.registry.revoke_run_token(&ctx.registry_token);
         let _ = self.db.finish_run(ctx.run_id, status, error.as_deref());
+        self.on_run_finished(&ctx, status).await;
         status
+    }
+
+    /// Follow-ups once a run ends: issue status, reviews and the merge queue, downstream repos.
+    async fn on_run_finished(self: &Arc<Self>, ctx: &Arc<RunCtx>, status: Status) {
+        if let Err(e) = crate::issues::on_run_finished(self, ctx, status).await {
+            tracing::warn!(run_id = ctx.run_id, "issue update failed: {e:#}");
+        }
+        if let Err(e) = crate::reviews::on_run_finished(self, ctx, status).await {
+            tracing::warn!(run_id = ctx.run_id, "review update failed: {e:#}");
+        }
+        if let Err(e) = crate::ai::on_run_finished(self, ctx, status).await {
+            tracing::warn!(run_id = ctx.run_id, "AI follow-up failed: {e:#}");
+        }
+        let on_default = ctx.git_ref == format!("refs/heads/{}", ctx.repo.default_branch);
+        if status == Status::Success && on_default {
+            if let Err(e) = self.trigger_downstream(ctx).await {
+                tracing::warn!(run_id = ctx.run_id, "downstream trigger failed: {e:#}");
+            }
+        }
+    }
+
+    /// Repos whose pipeline says `on: {upstream: <this repo>}` run on their default branch.
+    async fn trigger_downstream(self: &Arc<Self>, ctx: &RunCtx) -> Result<()> {
+        for other in self.db.repos(ctx.project_id)? {
+            if other.id == ctx.repo.id {
+                continue;
+            }
+            let path = self.git.path(other.id);
+            let Ok(sha) = self.git.resolve(&path, &other.default_branch).await else {
+                continue;
+            };
+            let Ok(src) = self.git.read_file(&path, &sha, PIPELINE_FILE).await else {
+                continue;
+            };
+            if Pipeline::parse(&src).is_ok_and(|p| p.on.upstream.contains(&ctx.repo.name)) {
+                self.trigger(
+                    other.id,
+                    &format!("refs/heads/{}", other.default_branch),
+                    Some(&sha),
+                    &format!("upstream:{}", ctx.repo.name),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     async fn execute_jobs(self: &Arc<Self>, ctx: &Arc<RunCtx>) -> Result<Status> {
@@ -252,26 +362,42 @@ impl Engine {
         };
         // Open the log before marking the job running, so a viewer that sees `running` can stream it.
         let _ = self.db.start_job(job_id);
-        let ws = self.work_dir.join(job_id.to_string());
+        let job_dir = self.work_dir.join(job_id.to_string());
+        let ws = job_dir.join(&ctx.repo.name);
         let started = Instant::now();
         let env = job_env(ctx, inst, spec, &self.registry_host);
 
         let (status, code) = if !spec.agent.is_empty() {
             self.run_on_agents(ctx, spec, &env, &log).await
         } else {
-            match self.git.checkout(ctx.project_id, &ctx.sha, &ws).await {
-                Ok(()) => {
-                    let r = self
-                        .run_steps(ctx, job_id, inst, spec, &env, &ws, &log)
-                        .await;
-                    self.git.remove(ctx.project_id, &ws).await;
-                    r
+            let mut checked_out = Vec::new();
+            let mut failed = None;
+            for (repo_id, sha, dest) in std::iter::once((ctx.repo.id, ctx.sha.clone(), ws.clone()))
+                .chain(ctx.siblings.iter().map(|(r, sha)| (r.id, sha.clone(), job_dir.join(&r.name))))
+            {
+                match self.git.checkout(repo_id, &sha, &dest).await {
+                    Ok(()) => checked_out.push((repo_id, dest)),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
                 }
-                Err(e) => {
+            }
+            let r = match failed {
+                None => {
+                    self.run_steps(ctx, job_id, inst, spec, &env, &job_dir, &ws, &log)
+                        .await
+                }
+                Some(e) => {
                     log.line(&format!("✗ checkout failed: {e:#}"));
                     (Status::Failed, None)
                 }
+            };
+            for (repo_id, dest) in checked_out {
+                self.git.remove(repo_id, &dest).await;
             }
+            let _ = tokio::fs::remove_dir_all(&job_dir).await;
+            r
         };
         log.line(&format!(
             "● {} in {:.1}s",
@@ -292,6 +418,7 @@ impl Engine {
         inst: &JobInstance,
         spec: &JobSpec,
         env: &[(String, String)],
+        job_dir: &std::path::Path,
         ws: &std::path::Path,
         log: &crate::logs::JobLog,
     ) -> (Status, Option<i32>) {
@@ -312,7 +439,15 @@ impl Engine {
         let exec = match &spec.image {
             None => Executor::Host,
             Some(image) => {
-                match Executor::docker(image, &format!("moloko-job-{job_id}"), ws, env, log).await {
+                match Executor::docker(
+                    image,
+                    &format!("moloko-job-{job_id}"),
+                    job_dir,
+                    &format!("/workspace/{}", ctx.repo.name),
+                    env,
+                    log,
+                )
+                .await {
                     Ok(e) => e,
                     Err(e) => {
                         log.line(&format!("✗ {e:#}"));
@@ -425,6 +560,8 @@ fn job_env(
         ("MOLOKO_SHA".into(), ctx.sha.clone()),
         ("MOLOKO_SHARD_INDEX".into(), idx.to_string()),
         ("MOLOKO_SHARD_TOTAL".into(), total.to_string()),
+        ("MOLOKO_PROJECT".into(), ctx.project_name.clone()),
+        ("MOLOKO_REPO".into(), ctx.repo.name.clone()),
         ("MOLOKO_REGISTRY".into(), registry_host.to_string()),
         ("MOLOKO_REGISTRY_USER".into(), "moloko".into()),
         ("MOLOKO_REGISTRY_TOKEN".into(), ctx.registry_token.clone()),
@@ -436,6 +573,9 @@ fn job_env(
             ),
         ),
     ];
+    if let Some(n) = ctx.review {
+        env.push(("MOLOKO_REVIEW".into(), n.to_string()));
+    }
     env.extend(spec.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
 }
@@ -493,7 +633,8 @@ jobs:
             .create_project("demo", repo.to_str().unwrap())
             .unwrap();
 
-        let run = engine.trigger(pid, "main", None, "manual").unwrap();
+        let rid = engine.db.repos(pid).unwrap()[0].id;
+        let run = engine.trigger(rid, "main", None, "manual").unwrap();
         assert_eq!(wait_done(&engine, run).await, "failed");
         let jobs = engine.db.jobs(run).unwrap();
         let by_name: HashMap<_, _> = jobs.iter().map(|j| (j.name.as_str(), j)).collect();
@@ -509,7 +650,7 @@ jobs:
         assert!(build_log.contains("building "));
 
         // Second run hits the cache.
-        let run2 = engine.trigger(pid, "main", None, "manual").unwrap();
+        let run2 = engine.trigger(rid, "main", None, "manual").unwrap();
         wait_done(&engine, run2).await;
         let build2 = engine
             .db
@@ -538,7 +679,8 @@ jobs:
             .db
             .create_project("demo", repo.to_str().unwrap())
             .unwrap();
-        let run = engine.trigger(pid, "main", None, "manual").unwrap();
+        let rid = engine.db.repos(pid).unwrap()[0].id;
+        let run = engine.trigger(rid, "main", None, "manual").unwrap();
         for _ in 0..100 {
             if engine
                 .db
@@ -574,7 +716,8 @@ jobs:
             .db
             .create_project("demo", repo.to_str().unwrap())
             .unwrap();
-        let run = engine.trigger(pid, "main", None, "manual").unwrap();
+        let rid = engine.db.repos(pid).unwrap()[0].id;
+        let run = engine.trigger(rid, "main", None, "manual").unwrap();
         assert_eq!(wait_done(&engine, run).await, "failed");
         assert!(
             engine
